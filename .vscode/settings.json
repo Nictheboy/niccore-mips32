@@ -1,0 +1,5 @@
+{
+    "verilog.formatting.verilogHDL.formatter": "verible-verilog-format",
+    "verilog.formatting.veribleVerilogFormatter.arguments": "--indentation_spaces=4",
+    "verilog.formatting.veribleVerilogFormatter.path": "verible-verilog-format"
+}
