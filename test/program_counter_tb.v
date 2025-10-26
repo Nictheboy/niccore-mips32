@@ -42,7 +42,7 @@ module program_counter_tb;
     // 按照您的要求：如果DUT输出与期望值匹配，correct为1
     // 注意：在时间0，pc_value为X，pc_value_expected为X，所以 'correct' 也将为X。
     // 在第一个时钟沿(复位)之后，'correct' 应该始终为 1。
-    assign correct = (pc_value == pc_value_expected);
+    assign correct = (pc_value === pc_value_expected);
 
     // --- Clock Generator ---
     always #((CLK_PERIOD) / 2) clock = ~clock;
