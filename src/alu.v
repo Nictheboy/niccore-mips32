@@ -5,8 +5,6 @@
  * 
  */
 
-`include "adder.v"
-
 module sra_unit (
     input [4:0] A,
     input signed [31:0] B,
