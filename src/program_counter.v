@@ -12,7 +12,7 @@ module program_counter (
     input [31:2] jump_input,
     output reg [31:2] pc_value
 );
-    localparam RESET_ADDR = 32'h00003000;
+    localparam RESET_ADDR = 32'h00003000 - 32'h00000004;
     always @(posedge clock) begin
         if (reset) pc_value <= RESET_ADDR[31:2];
         else if (jump_enable) pc_value <= jump_input;
