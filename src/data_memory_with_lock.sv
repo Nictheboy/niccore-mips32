@@ -1,26 +1,22 @@
 /*
  * Description :
  *
- * 带全局并行读写锁的数据内存 (Data Memory with Global Parallel Lock).
+ * 数据内存顶层包装 (Data Memory Wrapper).
  *
- * 主要功能特性：
- * 1. 全局锁机制：
- * 利用 parallel_rw_lock 对整个内存空间进行保护。
- * 支持 N 个 SIC 端口竞争访问。
- * 严格遵循 Issue ID 的顺序进行读写授权。
- *
- * 2. 读写行为：
- * - 写 (Write): 同步写入 (Clocked)，只有获得 Grant 且 req_write 为 1 时写入。
- * - 读 (Read): 组合逻辑输出 (Flash Read)，获得 Grant 时立即由多路选择器输出数据。
+ * 修改记录:
+ * 1. 不再内部实现存储数组，改为实例化单端口 data_memory 模块。
+ * 2. 锁机制替换为 resource_pool_lock。
+ * 3. 由于 data_memory 是单端口的，因此资源池大小 (NUM_RESOURCES) 设为 1。
+ * 这意味着同一时刻只有一个 SIC 能访问内存（严格串行化）。
  *
  * Author      : nictheboy
- * Create Date : 2025/12/15
+ * Date        : 2025/12/16
  *
  */
 
 module data_memory_with_lock #(
-    parameter int MEM_DEPTH,  // 内存大小 (Word数)
-    parameter int NUM_PORTS,     // SIC 端口数
+    parameter int MEM_DEPTH,
+    parameter int NUM_PORTS,
     parameter int ID_WIDTH
 ) (
     input logic clk,
@@ -32,6 +28,9 @@ module data_memory_with_lock #(
     input logic                req_write   [NUM_PORTS],
     input logic [ID_WIDTH-1:0] req_issue_id[NUM_PORTS],
     input logic                release_lock[NUM_PORTS],
+    // 写提交：解耦“占用内存写锁”和“真正写入内存”
+    // 只有 write_commit=1 的那个周期，write_enable 才会对 mem_core 生效
+    input logic                write_commit[NUM_PORTS],
     input logic [        31:0] wdata       [NUM_PORTS],
 
     // === 输出 ===
@@ -39,51 +38,91 @@ module data_memory_with_lock #(
     output logic        grant[NUM_PORTS]
 );
 
-    // 内存定义 (Word Addressable for implementation simplicity)
-    logic [31:0] memory[MEM_DEPTH];
+    // ============================================================
+    // 1. 锁信号与请求聚合
+    // ============================================================
+    logic       pool_req                [NUM_PORTS];
+    logic       pool_busy;  // 调试用
 
-    // 锁状态
-    logic lock_busy;
+    // alloc_id 在只有 1 个资源时其实没用 (总是0)，但为了匹配端口定义需要声明
+    // clog2(1) = 0, 所以这里定义为 [0:0] 1bit 宽是安全的
+    logic [0:0] alloc_id                [NUM_PORTS];
 
-    // 实例化并行读写锁 (全局唯一)
-    parallel_rw_lock #(
-        .NUM_PORTS(NUM_PORTS),
-        .ID_WIDTH (ID_WIDTH)
-    ) global_mem_lock (
+    // 将读写请求合并为通用请求
+    always_comb begin
+        for (int i = 0; i < NUM_PORTS; i++) begin
+            pool_req[i] = req_read[i] | req_write[i];
+        end
+    end
+
+    // 实例化资源池锁 (NUM_RESOURCES = 1)
+    resource_pool_lock #(
+        .NUM_RESOURCES(1),          // 关键：只有一个内存实例
+        .NUM_PORTS    (NUM_PORTS),
+        .ID_WIDTH     (ID_WIDTH)
+    ) mem_lock (
         .clk         (clk),
         .rst_n       (rst_n),
-        .req_read    (req_read),
-        .req_write   (req_write),
+        .req         (pool_req),
         .req_issue_id(req_issue_id),
         .release_lock(release_lock),
         .grant       (grant),
-        .lock_busy   (lock_busy)
+        .alloc_id    (alloc_id),      // 忽略，因为肯定分配的是资源 0
+        .pool_busy   (pool_busy)
     );
 
-    // 内存读写逻辑
-    always_ff @(posedge clk) begin
+    // ============================================================
+    // 2. 输入多路选择 (Mux: SIC -> Data Memory)
+    // ============================================================
+    // 单端口内存的输入信号
+    logic [31:2] mem_addr_in;
+    logic        mem_wen_in;
+    logic [31:0] mem_wdata_in;
+    logic [31:0] mem_rdata_out;
+
+    always_comb begin
+        // 默认值
+        mem_addr_in  = 0;
+        mem_wen_in   = 0;
+        mem_wdata_in = 0;
+
+        // 遍历端口，找到获得 Grant 的那个 SIC
         for (int i = 0; i < NUM_PORTS; i++) begin
-            // 写操作：同步
-            // 注意：这里将字节地址转换为字地址 (>> 2)
-            if (grant[i] && req_write[i]) begin
-                memory[addr[i][31:2]] <= wdata[i];
+            if (grant[i]) begin
+                mem_addr_in  = addr[i][31:2];  // 转换字节地址到字地址
+                // 只有提交时才真正写入（解决投机写内存的问题）
+                mem_wen_in   = req_write[i] && write_commit[i];
+                mem_wdata_in = wdata[i];
             end
         end
     end
 
-    // 读操作：组合逻辑 (Flash Read)
+    // ============================================================
+    // 3. 实例化现有内存模块
+    // ============================================================
+    data_memory #(
+        .MEM_DEPTH(MEM_DEPTH)
+    ) mem_core (
+        .reset       (~rst_n),        // 假设 data_memory reset 是高电平有效
+        .clock       (clk),
+        .address     (mem_addr_in),
+        .write_enable(mem_wen_in),
+        .write_input (mem_wdata_in),
+        .read_result (mem_rdata_out)
+    );
+
+    // ============================================================
+    // 4. 输出分发 (Demux: Data Memory -> SIC)
+    // ============================================================
     always_comb begin
         for (int i = 0; i < NUM_PORTS; i++) begin
-            rdata[i] = 'x;  // 默认无效
+            rdata[i] = 32'b0;  // 默认数据
+
+            // 如果该端口获得授权且是读操作，则输出数据
             if (grant[i] && req_read[i]) begin
-                rdata[i] = memory[addr[i][31:2]];
+                rdata[i] = mem_rdata_out;
             end
         end
-    end
-
-    // 初始化内存用于测试
-    initial begin
-        for (int k = 0; k < MEM_DEPTH; k++) memory[k] = 0;
     end
 
 endmodule

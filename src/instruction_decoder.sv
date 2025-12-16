@@ -43,9 +43,13 @@ typedef struct packed {
 // =========================================================
 
 module instruction_decoder (
-    input  wire [31:0]   instr,
-    output op_flags_t    op,   // 包含所有操作类型标志
-    output decoded_info_t info // 包含所有寄存器索引和立即数
+    input  wire           [31:0] instr,
+    output op_flags_t            op,        // 包含所有操作类型标志
+    output decoded_info_t        info,      // 包含所有寄存器索引和立即数
+    // === 额外输出：字段是否“有意义”（用于发射端重命名/调试）===
+    output logic                 rs_valid,
+    output logic                 rt_valid,
+    output logic                 rd_valid
 );
 
     // =========================================================
@@ -102,13 +106,13 @@ module instruction_decoder (
     // =========================================================
 
     // RS: op_alu_r, jr, ori, lw, sw, beq
-    wire rs_valid = op_alu_r | op.jr | op_ori | op_lw | op_sw | op_beq;
+    wire rs_valid_int = op_alu_r | op.jr | op_ori | op_lw | op_sw | op_beq;
 
     // RT: op_alu_r, ori, lw, sw, beq, lui (as destination)
-    wire rt_valid = op_alu_r | op_ori | op_lw | op_sw | op_beq | op_lui;
+    wire rt_valid_int = op_alu_r | op_ori | op_lw | op_sw | op_beq | op_lui;
 
     // RD: op_alu_r only
-    wire rd_valid = op_alu_r;
+    wire rd_valid_int = op_alu_r;
 
     // Funct: R-Type only
     wire funct_valid = is_r_type;
@@ -129,9 +133,9 @@ module instruction_decoder (
     // 结构体输出赋值: 解码信息 (Decoded Info)
     // =========================================================
 
-    assign info.rs    = rs_valid    ? instr[25:21] : 5'bx;
-    assign info.rt    = rt_valid    ? instr[20:16] : 5'bx;
-    assign info.rd    = rd_valid    ? instr[15:11] : 5'bx;
+    assign info.rs    = rs_valid_int    ? instr[25:21] : 5'bx;
+    assign info.rt    = rt_valid_int    ? instr[20:16] : 5'bx;
+    assign info.rd    = rd_valid_int    ? instr[15:11] : 5'bx;
     assign info.funct = funct_valid ? instr[5:0]   : 6'bx;
     assign info.imm16 = imm_valid   ? instr[15:0]  : 16'bx;
 
@@ -139,5 +143,10 @@ module instruction_decoder (
     assign info.imm16_zero_ext = zext_valid ? {16'b0, instr[15:0]} : 32'bx;
 
     assign info.jump_target    = jtarget_valid ? instr[25:0] : 26'bx;
+
+    // 输出字段有效性
+    assign rs_valid = rs_valid_int;
+    assign rt_valid = rt_valid_int;
+    assign rd_valid = rd_valid_int;
 
 endmodule

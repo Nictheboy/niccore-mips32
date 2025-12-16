@@ -37,12 +37,14 @@ module register_module #(
 
     // === 通用端口接口 (1D Arrays) ===
     // 索引 [0 ~ TOTAL_PORTS-1]
-    input logic [$clog2(NUM_PHY_REGS)-1:0] port_addr     [TOTAL_PORTS],
-    input logic                            port_req_read [TOTAL_PORTS],
-    input logic                            port_req_write[TOTAL_PORTS],
-    input logic [            ID_WIDTH-1:0] port_issue_id [TOTAL_PORTS],
-    input logic                            port_release  [TOTAL_PORTS],
-    input logic [                    31:0] port_wdata    [TOTAL_PORTS],
+    input logic [$clog2(NUM_PHY_REGS)-1:0] port_addr        [TOTAL_PORTS],
+    input logic                            port_req_read    [TOTAL_PORTS],
+    input logic                            port_req_write   [TOTAL_PORTS],
+    // 写提交信号：仅在真正需要修改寄存器值的那个周期拉高
+    input logic                            port_write_commit[TOTAL_PORTS],
+    input logic [            ID_WIDTH-1:0] port_issue_id    [TOTAL_PORTS],
+    input logic                            port_release     [TOTAL_PORTS],
+    input logic [                    31:0] port_wdata       [TOTAL_PORTS],
 
     // === 输出 ===
     output logic [31:0] port_rdata_out[TOTAL_PORTS],
@@ -51,10 +53,11 @@ module register_module #(
 
     // 内部互联矩阵
     // reg_req_xxx [寄存器索引] [端口索引]
-    logic        reg_req_read [NUM_PHY_REGS] [TOTAL_PORTS];
-    logic        reg_req_write[NUM_PHY_REGS] [TOTAL_PORTS];
-    logic        reg_grant    [NUM_PHY_REGS] [TOTAL_PORTS];
-    logic [31:0] reg_data_out [NUM_PHY_REGS];
+    logic        reg_req_read    [NUM_PHY_REGS] [TOTAL_PORTS];
+    logic        reg_req_write   [NUM_PHY_REGS] [TOTAL_PORTS];
+    logic        reg_write_commit[NUM_PHY_REGS] [TOTAL_PORTS];
+    logic        reg_grant       [NUM_PHY_REGS] [TOTAL_PORTS];
+    logic [31:0] reg_data_out    [NUM_PHY_REGS];
 
     // ============================================================
     // 1. 请求路由 (Routing: Ports -> Registers)
@@ -63,8 +66,9 @@ module register_module #(
         // 默认清零
         for (int r = 0; r < NUM_PHY_REGS; r++) begin
             for (int p = 0; p < TOTAL_PORTS; p++) begin
-                reg_req_read[r][p]  = 0;
+                reg_req_read[r][p] = 0;
                 reg_req_write[r][p] = 0;
+                reg_write_commit[r][p] = 0;
             end
         end
 
@@ -72,8 +76,9 @@ module register_module #(
         for (int p = 0; p < TOTAL_PORTS; p++) begin
             // 只有地址在合法范围内才路由请求
             if (port_addr[p] < NUM_PHY_REGS) begin
-                reg_req_read[port_addr[p]][p]  = port_req_read[p];
+                reg_req_read[port_addr[p]][p] = port_req_read[p];
                 reg_req_write[port_addr[p]][p] = port_req_write[p];
+                reg_write_commit[port_addr[p]][p] = port_write_commit[p];
             end
         end
     end
@@ -104,9 +109,10 @@ module register_module #(
                 .rst_n       (rst_n),
                 .req_read    (reg_req_read[r]),
                 .req_write   (reg_req_write[r]),
-                .req_issue_id(port_issue_id),     // 端口 ID 直接透传
+                .req_issue_id(port_issue_id),        // 端口 ID 直接透传
                 .release_lock(local_release),
-                .wdata       (port_wdata),        // 写数据直接透传
+                .write_commit(reg_write_commit[r]),
+                .wdata       (port_wdata),           // 写数据直接透传
                 .rdata       (reg_data_out[r]),
                 .grant       (reg_grant[r])
             );

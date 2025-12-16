@@ -1,43 +1,25 @@
 /*
  * Description :
- *
- * 带锁 ALU 资源阵列 (ALU Array with Integrated Locks).
- *
- * 本模块模拟了一个计算资源池。包含 M 个 ALU，N 个 SIC 端口。
- *
- * 工作机制：
- * 1. 路由 (Routing):
- * SIC 发出的请求包含目标 ALU ID (alu_id)。
- * 模块内部通过 Crossbar 将请求路由到对应的 ALU 单元。
- *
- * 2. 锁定与执行:
- * 每个 ALU 单元配备一个 mutex_lock。
- * 只有获得 Grant 的 SIC 请求会被送入 ALU 进行计算。
- *
- * 3. 组合逻辑输出:
- * ALU 本身是组合逻辑。一旦获得锁 (Grant=1)，结果立即有效。
- * 对于多周期操作(如除法)，SIC 可以保持锁直到计算完成。
- *
- * Author      : nictheboy
- * Create Date : 2025/12/15
- *
+ * 带资源池锁的 ALU 阵列。
+ * * 机制：
+ * 1. SIC 发出 req，不指定具体 ALU。
+ * 2. resource_pool_lock 返回 grant 和 allocated_res_id。
+ * 3. 输入 Mux: 根据锁内部状态，将获得授权的 SIC 的数据路由给对应的 ALU。
+ * 4. 输出 Mux: 根据 alloc_id，将对应 ALU 的结果路由回 SIC。
  */
-
 module alu_array_with_lock #(
-    parameter int NUM_ALUS,
-    parameter int NUM_PORTS,
-    parameter int ID_WIDTH
+    parameter int NUM_ALUS  = 4,
+    parameter int NUM_PORTS = 4,  // SIC 数量
+    parameter int ID_WIDTH  = 16
 ) (
     input logic clk,
     input logic rst_n,
 
-    // === SIC 接口 ===
-    // 选择哪个 ALU
-    input logic [$clog2(NUM_ALUS)-1:0] sic_alu_id  [NUM_PORTS],
-    // 请求信号 (不分读写，ALU 操作视为独占使用)
-    input logic                        sic_req     [NUM_PORTS],
-    input logic [        ID_WIDTH-1:0] sic_issue_id[NUM_PORTS],
-    input logic                        sic_release [NUM_PORTS],
+    // === SIC 接口 (Array) ===
+    // 注意：不再需要 sic_alu_id 输入，因为是动态分配
+    input logic                sic_req     [NUM_PORTS],
+    input logic [ID_WIDTH-1:0] sic_issue_id[NUM_PORTS],
+    input logic                sic_release [NUM_PORTS],
 
     // ALU 操作数
     input logic [31:0] sic_op_a   [NUM_PORTS],
@@ -45,116 +27,101 @@ module alu_array_with_lock #(
     input logic [ 5:0] sic_op_code[NUM_PORTS],
 
     // === 输出 ===
-    output logic [31:0] sic_res_out  [NUM_PORTS],
-    output logic        sic_zero_out [NUM_PORTS],
-    output logic        sic_grant_out[NUM_PORTS]
+    output logic [31:0] sic_res_out[NUM_PORTS],
+    output logic                       sic_zero_out [NUM_PORTS], // 虽然 ALU 没直接输出 Zero，这里演示根据结果生成
+    output logic sic_over_out[NUM_PORTS],
+    output logic sic_grant_out[NUM_PORTS]
 );
 
-    // 内部互联信号
-    logic        alu_req          [NUM_ALUS] [NUM_PORTS];
-    logic        alu_grant        [NUM_ALUS] [NUM_PORTS];
+    // 内部信号
+    logic [$clog2(NUM_ALUS)-1:0] allocated_alu_idx[NUM_PORTS];
+    logic                        pool_busy;
 
-    // ALU 输出暂存
-    logic [31:0] alu_res_internal [NUM_ALUS];
-    logic        alu_zero_internal[NUM_ALUS];
+    // ALU 阵列信号
+    logic [                31:0] alu_in_a         [ NUM_ALUS];
+    logic [                31:0] alu_in_b         [ NUM_ALUS];
+    logic [                 5:0] alu_in_op        [ NUM_ALUS];
+    logic [                31:0] alu_out_c        [ NUM_ALUS];
+    logic                        alu_out_v        [ NUM_ALUS];
 
-    // 1. 请求分发 (Demux: SIC -> ALU)
+    // ============================================================
+    // 1. 实例化资源池锁
+    // ============================================================
+    resource_pool_lock #(
+        .NUM_RESOURCES(NUM_ALUS),
+        .NUM_PORTS    (NUM_PORTS),
+        .ID_WIDTH     (ID_WIDTH)
+    ) pool_lock (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .req         (sic_req),
+        .req_issue_id(sic_issue_id),
+        .release_lock(sic_release),
+        .grant       (sic_grant_out),
+        .alloc_id    (allocated_alu_idx),
+        .pool_busy   (pool_busy)
+    );
+
+    // ============================================================
+    // 2. 输入交叉开关 (SIC -> ALU)
+    // 需要反向查找：哪个 SIC 拿到了 ALU[k]?
+    // 由于 resource_pool_lock 的 outputs 是基于 Port 的，我们需要转换视角，
+    // 或者我们在 Mux 逻辑里遍历所有 Ports。
+    // ============================================================
     always_comb begin
+        // 默认输入清零
         for (int k = 0; k < NUM_ALUS; k++) begin
-            for (int s = 0; s < NUM_PORTS; s++) begin
-                alu_req[k][s] = 0;
-            end
+            alu_in_a[k]  = 0;
+            alu_in_b[k]  = 0;
+            alu_in_op[k] = 0;
         end
 
-        for (int s = 0; s < NUM_PORTS; s++) begin
-            if (sic_alu_id[s] < NUM_ALUS) begin
-                alu_req[sic_alu_id[s]][s] = sic_req[s];
+        // 遍历所有 SIC 端口，如果该端口获得了授权，且分配的是 ALU[k]，则连接数据
+        for (int p = 0; p < NUM_PORTS; p++) begin
+            if (sic_grant_out[p]) begin
+                // 使用 allocated_alu_idx 直接定位 ALU
+                alu_in_a[allocated_alu_idx[p]]  = sic_op_a[p];
+                alu_in_b[allocated_alu_idx[p]]  = sic_op_b[p];
+                alu_in_op[allocated_alu_idx[p]] = sic_op_code[p];
             end
         end
     end
 
-    // 2. 生成 ALU + Mutex 实例
+    // ============================================================
+    // 3. 实例化 ALU 阵列
+    // ============================================================
     genvar k;
     generate
-        for (k = 0; k < NUM_ALUS; k++) begin : alu_slots
-
-            logic local_release[NUM_PORTS];
-            logic unit_grant   [NUM_PORTS];
-            logic busy;
-
-            // 本地释放信号生成
-            always_comb begin
-                for (int s = 0; s < NUM_PORTS; s++) begin
-                    local_release[s] = sic_release[s] && (sic_alu_id[s] == k);
-                end
-            end
-
-            // 互斥锁实例化
-            mutex_lock #(
-                .NUM_PORTS(NUM_PORTS),
-                .ID_WIDTH (ID_WIDTH)
-            ) alu_lock (
-                .clk         (clk),
-                .rst_n       (rst_n),
-                .req         (alu_req[k]),
-                .req_issue_id(sic_issue_id),
-                .release_lock(local_release),
-                .grant       (unit_grant),
-                .busy        (busy)
+        for (k = 0; k < NUM_ALUS; k++) begin : alu_insts
+            alu native_alu (
+                .A   (alu_in_a[k]),
+                .B   (alu_in_b[k]),
+                .Op  (alu_in_op[k]),
+                .C   (alu_out_c[k]),
+                .Over(alu_out_v[k])
             );
-
-            // 将 Grant 信号导出到内部网线
-            assign alu_grant[k] = unit_grant;
-
-            // ALU 实例化 (这里仅做简单的逻辑演示，实际可调用您的 alu 模块)
-            logic [31:0] op_a_mux;
-            logic [31:0] op_b_mux;
-            logic [ 5:0] op_code_mux;
-
-            // 输入数据多路选择：选择获得 Grant 的那个 SIC 的数据
-            always_comb begin
-                op_a_mux    = 0;
-                op_b_mux    = 0;
-                op_code_mux = 0;
-                for (int s = 0; s < NUM_PORTS; s++) begin
-                    if (unit_grant[s]) begin
-                        op_a_mux    = sic_op_a[s];
-                        op_b_mux    = sic_op_b[s];
-                        op_code_mux = sic_op_code[s];
-                    end
-                end
-            end
-
-            // 简单的 ALU 行为 (或者实例化您现有的 ALU 模块)
-            // 这里为了自包含，写一个简易版本
-            always_comb begin
-                case (op_code_mux)
-                    6'h20:   alu_res_internal[k] = op_a_mux + op_b_mux;  // add
-                    6'h22:   alu_res_internal[k] = op_a_mux - op_b_mux;  // sub
-                    6'h24:   alu_res_internal[k] = op_a_mux & op_b_mux;  // and
-                    6'h25:   alu_res_internal[k] = op_a_mux | op_b_mux;  // or
-                    default: alu_res_internal[k] = 0;
-                endcase
-                alu_zero_internal[k] = (alu_res_internal[k] == 0);
-            end
-
         end
     endgenerate
 
-    // 3. 输出多路复用 (Mux: ALU -> SIC)
+    // ============================================================
+    // 4. 输出交叉开关 (ALU -> SIC)
+    // 直接根据 lock 返回的 allocated_alu_idx 选择 ALU 输出
+    // ============================================================
     always_comb begin
-        for (int s = 0; s < NUM_PORTS; s++) begin
-            sic_grant_out[s] = 0;
-            sic_res_out[s]   = 'x;
-            sic_zero_out[s]  = 0;
+        for (int p = 0; p < NUM_PORTS; p++) begin
+            sic_res_out[p]  = 0;
+            sic_over_out[p] = 0;
+            sic_zero_out[p] = 0;
 
-            if (sic_alu_id[s] < NUM_ALUS) begin
-                sic_grant_out[s] = alu_grant[sic_alu_id[s]][s];
+            if (sic_grant_out[p]) begin
+                // 如果获得了锁，直接读取分配到的 ALU 的结果
+                // 这里就是 Requirement 4 实现的关键：自动设置为正确信号
+                // 且因为全是组合逻辑，配合 Requirement 5 实现 Flash Path
+                sic_res_out[p]  = alu_out_c[allocated_alu_idx[p]];
+                sic_over_out[p] = alu_out_v[allocated_alu_idx[p]];
 
-                if (sic_grant_out[s]) begin
-                    sic_res_out[s]  = alu_res_internal[sic_alu_id[s]];
-                    sic_zero_out[s] = alu_zero_internal[sic_alu_id[s]];
-                end
+                // 附加生成 Zero 标志
+                sic_zero_out[p] = (alu_out_c[allocated_alu_idx[p]] == 0);
             end
         end
     end

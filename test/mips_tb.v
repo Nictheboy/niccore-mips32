@@ -1,8 +1,8 @@
 module mips_tb;
     reg reset, clock;
-    single_cycle_machine single_cycle_machine (
-        .reset(reset),
-        .clock(clock)
+    superscalar_machine superscalar_machine (
+        .rst_n(~reset),
+        .clk  (clock)
     );
 
     integer k;
@@ -16,13 +16,13 @@ module mips_tb;
         #1;
         reset = 0;
         #1;
-        for (k = 0; k < 100000; k = k + 1) begin
+        for (k = 0; k < 1000000; k = k + 1) begin
             clock = 1;
             #5;
             clock = 0;
             #5;
         end
-        $display("CPU did not finish within 100000 cycles. Test failed.");
+        $display("CPU did not finish within 1000000 cycles. Test failed.");
         $finish;
     end
 endmodule

@@ -37,6 +37,9 @@ module register_with_lock #(
     input logic                req_write   [NUM_PORTS],
     input logic [ID_WIDTH-1:0] req_issue_id[NUM_PORTS],
     input logic                release_lock[NUM_PORTS],
+    // 写提交信号：用于将“占用锁/保留”与“真正写入”解耦
+    // 只有 write_commit=1 的那个周期才会更新 reg_data
+    input logic                write_commit[NUM_PORTS],
     input logic [        31:0] wdata       [NUM_PORTS],
 
     // 输出
@@ -73,7 +76,8 @@ module register_with_lock #(
             reg_data <= 32'b0;
         end else begin
             for (int i = 0; i < NUM_PORTS; i++) begin
-                if (grant[i] && req_write[i]) begin
+                // 只有在 (获得锁) AND (请求写/保持写锁) AND (确认提交) 时才真正写入
+                if (grant[i] && req_write[i] && write_commit[i]) begin
                     reg_data <= wdata[i];
                 end
             end

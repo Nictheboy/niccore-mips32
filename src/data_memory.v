@@ -1,12 +1,12 @@
-/* 
- *  Description : Data Memory.
- *                It's implemented using registers for demo.
- *  Author      : nictheboy <nictheboy@outlook.com>
- *  Create Date : 2025/10/26
- * 
+/* * Description : Data Memory (Parameterized).
+ * Author      : nictheboy <nictheboy@outlook.com>
+ * Create Date : 2025/10/26
+ * Modified    : Parameterized version
  */
 
-module data_memory (
+module data_memory #(
+    parameter MEM_DEPTH = 2048  // 改为 parameter，默认值保持 2048
+) (
     input reset,
     input clock,
     input [31:2] address,
@@ -14,11 +14,16 @@ module data_memory (
     input [31:0] write_input,
     output reg [31:0] read_result
 );
-    localparam UNIT_COUNT = 2048;
-    localparam VALID_ADDRESS_WIDTH = 11;
+    // 自动计算所需的地址线位宽 (例如 2048 -> 11)
+    localparam VALID_ADDRESS_WIDTH = $clog2(MEM_DEPTH);
 
-    reg [31:0] data[UNIT_COUNT-1 : 0];
-    wire [VALID_ADDRESS_WIDTH-1 : 0] valid_address = address[VALID_ADDRESS_WIDTH+2-1 : 2];
+    reg [31:0] data[MEM_DEPTH-1 : 0];  // 数组大小改为参数控制
+
+    // 地址计算逻辑微调：[VALID_ADDRESS_WIDTH+2-1 : 2] 等价于 [VALID_ADDRESS_WIDTH+1 : 2]
+    wire [VALID_ADDRESS_WIDTH-1 : 0] valid_address = address[VALID_ADDRESS_WIDTH+1 : 2];
+
+    // 验证逻辑保持不变：检查除去有效位之外的高位是否全为0
+    // 输入地址是 [31:2]，共 30 bit。
     wire address_is_valid = (address == {{(30 - VALID_ADDRESS_WIDTH) {1'b0}}, valid_address});
 
     always @(*) begin
@@ -32,7 +37,7 @@ module data_memory (
     integer i;
     always @(negedge clock) begin
         if (reset) begin
-            for (i = 0; i < UNIT_COUNT; i = i + 1) begin
+            for (i = 0; i < MEM_DEPTH; i = i + 1) begin  // 循环上限改为参数
                 data[i] <= 32'h00000000;
             end
         end else if (write_enable && address_is_valid) begin
