@@ -17,25 +17,26 @@ module issue_controller #(
     // SIC 交互接口
     input  logic                       sic_req_instr           [NUM_SICS],
     output sic_packet_t                sic_packet_out          [NUM_SICS],
-    // SIC -> Issue：用于判断某个 ECR 是否仍被至少一个 SIC 依赖/读取
-    input  logic                       sic_dep_ecr_active      [NUM_SICS],
-    input  logic        [         1:0] sic_dep_ecr_id          [NUM_SICS],
     // SIC -> Issue：JR 提交后的 PC 重定向（当发射到 jr 后，Issue 会等待该重定向再继续发射）
     input  logic                       sic_pc_redirect_valid   [NUM_SICS],
     input  logic        [        31:0] sic_pc_redirect_pc      [NUM_SICS],
     input  logic        [ID_WIDTH-1:0] sic_pc_redirect_issue_id[NUM_SICS],
 
-    // ECR 监控与回滚
-    input  logic [1:0] ecr_states      [2],  // 监控 2 个 ECR 的状态
-    output logic       rollback_trigger,     // 调试/监控用
+    // 回滚指示（调试/监控用）
+    output logic rollback_trigger,
 
-    // ECR 写接口：用于在分配 ECR 时将其置为 Busy (00)
-    output logic ecr_reset_wen,
-    output logic [0:0] ecr_reset_addr,  // 假设 2 个 ECR，地址宽度为 1
-    output logic [1:0] ecr_reset_data  // 固定为 2'b00 (Busy)
-    ,  // === Register File Allocate (to register_file) ===
+    // === Register File Allocate (to register_file) ===
     output logic rf_alloc_wen[NUM_SICS],
-    output logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr[NUM_SICS]
+    output logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr[NUM_SICS],
+
+    // ECR -> Issue：汇总状态（allocator + rollback + in_use）
+    input ecr_status_for_issue#(2)::t ecr_status,
+
+    // Issue -> ECR：统一更新（reset + bpinfo + altpc）
+    output ecr_reset_for_issue#(2)::t ecr_update,
+
+    // ECR -> BP：更新由 ECR 产生（issue_controller 仅转接到 BP 实例）
+    input bp_update_t bp_update
 );
 
     // PC 管理
@@ -96,9 +97,8 @@ module issue_controller #(
                 .rst_n(rst_n),
                 .query_pc(pc + (k << 2)),
                 .pred_taken(pred_taken_w[k]),
-                .update_en(1'b0),
-                .update_pc('0),
-                .actual_taken(1'b0)  // 更新由 SIC 做
+                // 更新由 ECR 做，issue_controller 仅转接
+                .bp_update(bp_update)
             );
         end
     endgenerate
@@ -107,18 +107,9 @@ module issue_controller #(
     logic trigger_rollback;
     logic [31:0] rollback_target_pc;
     logic rollback_ecr_valid;
-    logic rollback_ecr_idx;
+    logic [0:0] rollback_ecr_idx;
 
-    // 简单的回滚策略：如果有任何一个 ECR 报错，全流水线回滚
-    // 在真实设计中需要知道是哪个 ECR 对应的哪个 PC，这里简化为回滚到已保存的 checkpoint
-    // 由于 ECR 只有两个，我们这里做简化假设：
-    // 统一采用 0-based：ECR0 对应 PC_A, ECR1 对应 PC_B。
-    // 这里为了实现设想中的“回滚发射”，我们需要记录分支时的 Alternative PC。
-
-    logic [31:0] saved_alt_pc[0:1];  // 对应 ECR0/ECR1 的备选 PC
-
-    // 由 SIC 反馈计算：某个 ECR 是否仍被至少一个 SIC 依赖/读取
-    logic ecr_in_use[2];
+    // 回滚信息由 ECR 提供（ecr_status.rollback_*）
 
     assign imem_addr = pc;
     assign rollback_trigger = trigger_rollback;
@@ -127,35 +118,10 @@ module issue_controller #(
     // - 发生回滚时对触发回滚的 ECR 写 01(已确定) 以“ack”该次回滚，避免每周期重复回滚
 
     always_comb begin
-        trigger_rollback   = 0;
-        rollback_target_pc = 0;
-        rollback_ecr_valid = 0;
-        rollback_ecr_idx   = 0;
-
-        // 检查 ECR 状态 (10 = Predict Incorrect)
-        if (ecr_states[0] == 2'b10) begin
-            trigger_rollback   = 1;
-            rollback_target_pc = saved_alt_pc[0];
-            rollback_ecr_valid = 1;
-            rollback_ecr_idx   = 0;
-        end else if (ecr_states[1] == 2'b10) begin
-            trigger_rollback   = 1;
-            rollback_target_pc = saved_alt_pc[1];
-            rollback_ecr_valid = 1;
-            rollback_ecr_idx   = 1;
-        end
-    end
-
-    // 计算 ECR 是否被至少一个 SIC 依赖
-    always_comb begin
-        ecr_in_use[0] = 0;
-        ecr_in_use[1] = 0;
-        for (int i = 0; i < NUM_SICS; i++) begin
-            if (sic_dep_ecr_active[i]) begin
-                if (sic_dep_ecr_id[i] == 0) ecr_in_use[0] = 1;
-                else if (sic_dep_ecr_id[i] == 1) ecr_in_use[1] = 1;
-            end
-        end
+        trigger_rollback   = ecr_status.rollback_valid;
+        rollback_target_pc = ecr_status.rollback_target_pc;
+        rollback_ecr_valid = ecr_status.rollback_valid;
+        rollback_ecr_idx   = ecr_status.rollback_id;
     end
 
     // 主逻辑
@@ -171,9 +137,7 @@ module issue_controller #(
                 free_bitmap[pr] <= 1'b1;
             end
             pending_free_cnt <= 0;
-            ecr_reset_wen <= 0;
-            ecr_reset_addr <= '0;
-            ecr_reset_data <= 2'b00;
+            ecr_update <= '0;
             jr_waiting <= 0;
             jr_wait_issue_id <= '0;
             for (int i = 0; i < 32; i++) rat[i] <= i;
@@ -206,17 +170,13 @@ module issue_controller #(
             // 回滚后让后续指令依赖于“刚被确定”的 ECR（我们会把它 ack 成 01）
             active_ecr <= rollback_ecr_idx;
             jr_waiting <= 0;
-            // 关键修复：清除触发回滚的 ECR 的 10 状态，否则 trigger_rollback 会永远为真
-            // 这里我们把它置为 01(已确定)，表示“这次回滚已处理完毕”
+            // Ack：清除触发回滚的 ECR 的 10 状态，避免重复回滚
+            ecr_update <= '0;
             if (rollback_ecr_valid) begin
-                ecr_reset_wen  <= 1;
-                // rollback_ecr_idx 本身就是 1-bit（ECR0/ECR1）
-                ecr_reset_addr <= rollback_ecr_idx;
-                ecr_reset_data <= 2'b01;
-            end else begin
-                ecr_reset_wen  <= 0;
-                ecr_reset_addr <= '0;
-                ecr_reset_data <= 2'b00;
+                ecr_update.wen        <= 1'b1;
+                ecr_update.addr       <= rollback_ecr_idx;
+                ecr_update.do_reset   <= 1'b1;
+                ecr_update.reset_data <= 2'b01;
             end
             // 回滚时，当前周期的输出应设为无效
             for (int i = 0; i < NUM_SICS; i++) begin
@@ -228,6 +188,8 @@ module issue_controller #(
                 rf_alloc_pr[s]  <= '0;
             end
         end else begin
+            // 默认不更新 ECR
+            ecr_update <= '0;
             // =========================================================
             // 0. JR 等待模式：不发射，直到收到匹配 issue_id 的 PC 重定向
             // =========================================================
@@ -255,9 +217,7 @@ module issue_controller #(
                 end
 
                 // 默认不写 ECR
-                ecr_reset_wen  <= 0;
-                ecr_reset_addr <= '0;
-                ecr_reset_data <= 2'b00;
+                // ecr_update 在外层已默认清零
 
                 if (got_redirect) begin
                     pc <= redirect_pc;
@@ -291,9 +251,7 @@ module issue_controller #(
                 issue_stall = 0;
                 jr_issued_this_cycle = 0;
                 // 默认不写 ECR
-                ecr_reset_wen  <= 0;
-                ecr_reset_addr <= '0;
-                ecr_reset_data <= 2'b00;
+                // ecr_update 在外层已默认清零
 
                 // 工作副本：本周期内滚动修改，最后一次性提交
                 free_bitmap_work = free_bitmap;
@@ -311,7 +269,7 @@ module issue_controller #(
                 // Quiescent reclaim：当所有 SIC 都空闲时，把旧版本物理寄存器放回 free_bitmap
                 all_sics_quiet = 1;
                 for (int s = 0; s < NUM_SICS; s++) begin
-                    if (sic_dep_ecr_active[s]) all_sics_quiet = 0;
+                    if (!sic_req_instr[s]) all_sics_quiet = 0;
                 end
                 if (all_sics_quiet && (pending_free_cnt_work > 0)) begin
                     // 综合友好：循环上界必须是常量，不能用 pending_free_cnt_work
@@ -475,57 +433,59 @@ module issue_controller #(
 
                         // 分支/跳转与 ECR
                         if (is_beq) begin
-                            logic [ 1:0] next_ecr_candidate;
                             logic [31:0] current_instr_pc;
                             logic [31:0] branch_target;
                             logic [31:0] fall_through;
+                            logic [ 0:0] alloc_ecr;
 
-                            // 统一 0-based：在 ECR0/ECR1 之间翻转分配给下一条分支
-                            next_ecr_candidate = (current_active_ecr == 0) ? 1 : 0;
+                            alloc_ecr = ecr_status.alloc_id;
 
-                            // 等待 ECR 被确定 (Wait until determined)
-                            // 假设 ECR 状态 2'b00 表示 Undefined/Busy，01/10 表示已确定
-                            // 如果下一个要用的 ECR 还是 Busy，则必须 Stall，不能覆盖它
-                            // 如果目标 ECR 仍 Busy，或者仍被至少一个 SIC 依赖，则必须 Stall，不能覆盖它
-                            if (ecr_states[next_ecr_candidate] == 2'b00 || ecr_in_use[next_ecr_candidate]) begin
+                            // 由 ECR 内部仲裁：只要 alloc_avail=0 就必须 Stall
+                            if (!ecr_status.alloc_avail) begin
                                 // 资源冲突，停止发射当前指令及后续指令
                                 sic_packet_out[i] <= 'x;
                                 sic_packet_out[i].valid <= 0;
                                 issue_stall = 1;
                             end else begin
                                 // ECR 可用，分配给当前分支
-                                sic_packet_out[i].set_ecr_id <= next_ecr_candidate;
+                                sic_packet_out[i].set_ecr_id <= alloc_ecr;
 
                                 // 关键：保存检查点（用于该分支预测失败时恢复 RAT/free_bitmap/pending_free）
                                 for (int r = 0; r < 32; r++) begin
-                                    rat_ckpt[next_ecr_candidate][r] <= rat_work[r];
+                                    rat_ckpt[alloc_ecr][r] <= rat_work[r];
                                 end
-                                free_bitmap_ckpt[next_ecr_candidate] <= free_bitmap_work;
+                                free_bitmap_ckpt[alloc_ecr] <= free_bitmap_work;
                                 for (int k = 0; k < NUM_PHY_REGS; k++) begin
-                                    pending_free_ckpt[next_ecr_candidate][k] <= pending_free_work[k];
+                                    pending_free_ckpt[alloc_ecr][k] <= pending_free_work[k];
                                 end
-                                pending_free_cnt_ckpt[next_ecr_candidate] <= pending_free_cnt_work;
+                                pending_free_cnt_ckpt[alloc_ecr] <= pending_free_cnt_work;
 
-                                // 立即将该 ECR 置为 Busy (00)
-                                ecr_reset_wen <= 1;
-                                ecr_reset_addr <= next_ecr_candidate[$bits(ecr_reset_addr)-1:0];
-                                ecr_reset_data <= 2'b00;
+                                // 立即将该 ECR 置为 Busy (00) + 写入分支元信息 + 写入 alt_pc
+                                ecr_update <= '0;
+                                ecr_update.wen <= 1'b1;
+                                ecr_update.addr <= alloc_ecr[$bits(ecr_update.addr)-1:0];
+                                ecr_update.do_reset <= 1'b1;
+                                ecr_update.reset_data <= 2'b00;
+                                ecr_update.do_bpinfo <= 1'b1;
+                                ecr_update.bpinfo_pc <= pc + (slot << 2);
+                                ecr_update.bpinfo_pred_taken <= pred_taken_w[slot];
+                                ecr_update.do_altpc <= 1'b1;
 
                                 // 更新循环变量，使得下一条指令依赖于这个新 ECR
-                                current_active_ecr = next_ecr_candidate;
+                                current_active_ecr = alloc_ecr;
 
                                 current_instr_pc = pc + (slot << 2);
                                 branch_target = current_instr_pc + 4 + (dec_info[slot].imm16_sign_ext << 2);
                                 fall_through = current_instr_pc + 4;
 
                                 if (pred_taken_w[slot]) begin
-                                    sic_packet_out[i].next_pc_pred   <= branch_target;
-                                    saved_alt_pc[next_ecr_candidate] <= fall_through;
+                                    sic_packet_out[i].next_pc_pred <= branch_target;
+                                    ecr_update.altpc_pc <= fall_through;
                                     next_cycle_pc = branch_target;
                                     branch_taken_in_packet = 1;
                                 end else begin
-                                    sic_packet_out[i].next_pc_pred   <= fall_through;
-                                    saved_alt_pc[next_ecr_candidate] <= branch_target;
+                                    sic_packet_out[i].next_pc_pred <= fall_through;
+                                    ecr_update.altpc_pc <= branch_target;
                                 end
                             end
                         end else if (is_j || is_jal) begin

@@ -25,8 +25,7 @@ module superscalar_machine (
     logic sic_req_instr[NUM_SICS];
     sic_packet_t sic_packets[NUM_SICS];
     // SIC -> Issue：ECR 依赖反馈
-    logic sic_dep_ecr_active[NUM_SICS];
-    logic [1:0] sic_dep_ecr_id[NUM_SICS];
+    logic sic_ecr_read_en[NUM_SICS];
     // SIC -> Issue：JR PC 重定向反馈
     logic sic_pc_redirect_valid[NUM_SICS];
     logic [31:0] sic_pc_redirect_pc[NUM_SICS];
@@ -36,10 +35,12 @@ module superscalar_machine (
     logic [1:0] ecr_monitor[NUM_ECRS];
     logic rollback_sig;
 
-    // Issue Controller -> ECR (Reset Port)
-    logic issue_ecr_wen;
-    logic [0:0] issue_ecr_waddr;
-    logic [1:0] issue_ecr_wdata;  // 通常为 2'b00 (Busy)
+    // Issue <-> ECR（打包）
+    ecr_reset_for_issue #(NUM_ECRS)::t issue_ecr_update;
+    ecr_status_for_issue #(NUM_ECRS)::t ecr_status;
+
+    // ECR -> BP：更新（由 ECR 产生）
+    bp_update_t ecr_bp_update;
 
     // Issue Controller -> Register File allocate (new lifecycle pulse)
     logic rf_alloc_wen[NUM_SICS];
@@ -99,17 +100,13 @@ module superscalar_machine (
         .imem_data(imem_data),
         .sic_req_instr(sic_req_instr),
         .sic_packet_out(sic_packets),
-        .sic_dep_ecr_active(sic_dep_ecr_active),
-        .sic_dep_ecr_id(sic_dep_ecr_id),
         .sic_pc_redirect_valid(sic_pc_redirect_valid),
         .sic_pc_redirect_pc(sic_pc_redirect_pc),
         .sic_pc_redirect_issue_id(sic_pc_redirect_issue_id),
-        .ecr_states(ecr_monitor),
         .rollback_trigger(rollback_sig),
-        // Issue Controller 在分配 ECR 时将其置为 Busy(00)
-        .ecr_reset_wen(issue_ecr_wen),
-        .ecr_reset_addr(issue_ecr_waddr),
-        .ecr_reset_data(issue_ecr_wdata),
+        .ecr_status(ecr_status),
+        .ecr_update(issue_ecr_update),
+        .bp_update(ecr_bp_update),
         // Register File allocate pulse
         .rf_alloc_wen(rf_alloc_wen),
         .rf_alloc_pr(rf_alloc_pr)
@@ -154,13 +151,10 @@ module superscalar_machine (
                 .ecr_wdata(sic_ecr_wdata[i]),
 
                 // BP Update
-                .bp_update_en(),
-                .bp_update_pc(),
-                .bp_actual_taken(),
+                // BP Update：已迁移到 ECR 内部（无需 SIC 直接驱动）
 
                 // ECR Dep Feedback
-                .dep_ecr_active(sic_dep_ecr_active[i]),
-                .dep_ecr_id_out(sic_dep_ecr_id[i]),
+                .ecr_read_en(sic_ecr_read_en[i]),
 
                 // JR Redirect Feedback
                 .pc_redirect_valid(sic_pc_redirect_valid[i]),
@@ -221,17 +215,15 @@ module superscalar_machine (
     ) ecr_file (
         .clk(clk),
         .rst_n(rst_n),
+        .sic_read_en(sic_ecr_read_en),
         .sic_read_addr(sic_ecr_read_addr),
         .sic_read_data(sic_ecr_read_data),  // Output from module
         .sic_wen(sic_ecr_wen),
         .sic_write_addr(sic_ecr_write_addr),
         .sic_wdata(sic_ecr_wdata),
-
-        // Issue Controller Reset/Busy 端口
-        .issue_wen(issue_ecr_wen),
-        .issue_write_addr(issue_ecr_waddr),
-        .issue_wdata(issue_ecr_wdata),
-
+        .issue_update(issue_ecr_update),
+        .bp_update(ecr_bp_update),
+        .status_for_issue(ecr_status),
         .monitor_states(ecr_monitor)
     );
 

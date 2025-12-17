@@ -31,21 +31,14 @@ module single_instruction_controller #(
 
     // 与 ECR 交互 (简化接口)
     // 读接口：直接输出地址，组合逻辑读取
-    output logic [$clog2(2)-1:0] ecr_read_addr,  // 假设 NUM_ECRS=2
+    output logic                 ecr_read_en,
+    output logic [$clog2(2)-1:0] ecr_read_addr,   // 假设 NUM_ECRS=2
     input  logic [          1:0] ecr_read_data,
-
     // 写接口：写使能和地址数据
     output logic                 ecr_wen,
     output logic [$clog2(2)-1:0] ecr_write_addr,
     output logic [          1:0] ecr_wdata,
 
-    // 分支预测更新 (简单直连 BP)
-    output logic                bp_update_en,
-    output logic [        31:0] bp_update_pc,
-    output logic                bp_actual_taken,
-    // === 反馈给 Issue Controller 的 ECR 使用情况（用于判断 ECR 是否仍被至少一个 SIC 依赖）===
-    output logic                dep_ecr_active,
-    output logic [         1:0] dep_ecr_id_out,
     // === JR：提交后 PC 重定向反馈 ===
     output logic                pc_redirect_valid,
     output logic [        31:0] pc_redirect_pc,
@@ -168,9 +161,8 @@ module single_instruction_controller #(
     // ECR 读地址：统一采用 0-based 编号（ECR0=0, ECR1=1）
     assign ecr_read_addr = pkt.dep_ecr_id[$clog2(2)-1:0];
 
-    // 反馈：当 SIC 持有一条正在执行的指令时，认为它“仍在依赖/读取 dep_ecr”
-    assign dep_ecr_active = (state != IDLE) && (state != WAIT_PACKET);
-    assign dep_ecr_id_out = dep_ecr_active ? pkt.dep_ecr_id : 'x;
+    // ECR 读使能：SIC 在执行一条有效指令期间，认为自己“正在依赖/读取 dep_ecr”
+    assign ecr_read_en = (state != IDLE) && (state != WAIT_PACKET);
 
     // 如果处于 IDLE，或者处于 WAIT 且还没收到 Valid 数据，则请求指令
     // 一旦收到 packet_in.valid，req_instr 会立即拉低，防止发射控制器在下一个沿误判
@@ -183,7 +175,6 @@ module single_instruction_controller #(
             mem_release_pulse <= 0;
             alu_release_pulse <= 0;
             ecr_wen <= 0;
-            bp_update_en <= 0;
             reg_wdata_dst <= 32'b0;
             mem_addr_hold <= 32'b0;
             mem_wdata_hold <= 32'b0;
@@ -196,7 +187,6 @@ module single_instruction_controller #(
             mem_release_pulse <= 0;
             alu_release_pulse <= 0;
             ecr_wen           <= 0;
-            bp_update_en      <= 0;
             pc_redirect_valid <= 0;
 
             case (state)
@@ -319,10 +309,6 @@ module single_instruction_controller #(
                         if (actual_taken == pkt.pred_taken) ecr_wdata <= 2'b01;  // Correct
                         else ecr_wdata <= 2'b10;  // Incorrect
 
-                        // 更新 BP
-                        bp_update_en <= 1;
-                        bp_update_pc <= pkt.pc;
-                        bp_actual_taken <= actual_taken;
                     end
 
                     // JR：提交时输出 PC 重定向（issue_controller 会暂停发射直到收到它）

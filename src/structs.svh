@@ -110,6 +110,63 @@ typedef struct packed {
 } alu_ans_t;
 
 // -----------------------------
+// Branch predictor update bundle
+// -----------------------------
+typedef struct packed {
+    logic        en;
+    logic [31:0] pc;
+    logic        actual_taken;
+} bp_update_t;
+
+// -----------------------------
+// ECR <-> issue_controller bundles
+// -----------------------------
+class ecr_status_for_issue #(
+    parameter int NUM_ECRS = 2
+);
+    localparam int ecr_w = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
+    typedef struct packed {
+        // allocator
+        logic             alloc_avail;
+        logic [ecr_w-1:0] alloc_id;
+
+        // rollback request (issue consumes it and performs rollback)
+        logic             rollback_valid;
+        logic [ecr_w-1:0] rollback_id;
+        logic [31:0]      rollback_target_pc;
+
+        // in_use bitmap (optional for debug / allocation policy)
+        logic [NUM_ECRS-1:0] in_use;
+    } t;
+endclass
+
+class ecr_reset_for_issue #(
+    parameter int NUM_ECRS = 2
+);
+    localparam int ecr_w = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
+    typedef struct packed {
+        // single-cycle pulse; when 0, ignore everything else
+        logic             wen;
+        logic [ecr_w-1:0] addr;
+
+        // which payloads are valid this cycle
+        logic do_reset;
+        logic do_bpinfo;
+        logic do_altpc;
+
+        // reset/write of ecr_regs[addr]
+        logic [1:0] reset_data;  // 00=busy, 01=free/correct, 10=incorrect
+
+        // branch metadata (for BP update generation)
+        logic [31:0] bpinfo_pc;
+        logic        bpinfo_pred_taken;
+
+        // rollback target PC (alt pc)
+        logic [31:0] altpc_pc;
+    } t;
+endclass
+
+// -----------------------------
 // Register file request/answer bundle (SIC <-> register_file)
 // -----------------------------
 class reg_req #(
