@@ -58,6 +58,10 @@ module issue_controller #(
     output logic       ecr_reset_wen,
     output logic [0:0] ecr_reset_addr,  // 假设 2 个 ECR，地址宽度为 1
     output logic [1:0] ecr_reset_data   // 固定为 2'b00 (Busy)
+    ,
+    // === Register File Allocate (to register_file) ===
+    output logic                             rf_alloc_wen[NUM_SICS],
+    output logic [$clog2(NUM_PHY_REGS)-1:0]  rf_alloc_pr [NUM_SICS]
 );
 
     // PC 管理
@@ -207,6 +211,10 @@ module issue_controller #(
             jr_waiting <= 0;
             jr_wait_issue_id <= '0;
             for (int i = 0; i < 32; i++) rat[i] <= i;
+            for (int s = 0; s < NUM_SICS; s++) begin
+                rf_alloc_wen[s] <= 0;
+                rf_alloc_pr[s]  <= '0;
+            end
             // 检查点初始化为当前状态
             for (int e = 0; e < 2; e++) begin
                 for (int i = 0; i < 32; i++) rat_ckpt[e][i] <= i[$clog2(NUM_PHY_REGS)-1:0];
@@ -249,6 +257,10 @@ module issue_controller #(
                 sic_packet_out[i] <= 'x;
                 sic_packet_out[i].valid <= 0;
             end
+            for (int s = 0; s < NUM_SICS; s++) begin
+                rf_alloc_wen[s] <= 0;
+                rf_alloc_pr[s]  <= '0;
+            end
         end else begin
             // =========================================================
             // 0. JR 等待模式：不发射，直到收到匹配 issue_id 的 PC 重定向
@@ -270,6 +282,10 @@ module issue_controller #(
                 for (int i = 0; i < NUM_SICS; i++) begin
                     sic_packet_out[i] <= 'x;
                     sic_packet_out[i].valid <= 0;
+                end
+                for (int s = 0; s < NUM_SICS; s++) begin
+                    rf_alloc_wen[s] <= 0;
+                    rf_alloc_pr[s]  <= '0;
                 end
 
                 // 默认不写 ECR
@@ -318,6 +334,12 @@ module issue_controller #(
                 pending_free_cnt_work = pending_free_cnt;
                 for (int k = 0; k < NUM_PHY_REGS; k++) begin
                     pending_free_work[k] = pending_free[k];
+                end
+
+                // 默认：本周期不 allocate 新生命周期（仅当成功分配目的物理寄存器时才拉高对应端口）
+                for (int s = 0; s < NUM_SICS; s++) begin
+                    rf_alloc_wen[s] = 0;
+                    rf_alloc_pr[s]  = '0;
                 end
 
                 // Quiescent reclaim：当所有 SIC 都空闲时，把旧版本物理寄存器放回 free_bitmap
@@ -434,6 +456,9 @@ module issue_controller #(
                                 free_bitmap_work[alloc_pr] = 1'b0;
                                 dest_pr = alloc_pr[$clog2(NUM_PHY_REGS)-1:0];
                                 sic_packet_out[i].phy_dst <= dest_pr;
+                            // 发出“开启新生命周期”脉冲给寄存器文件
+                            rf_alloc_wen[i] = 1;
+                            rf_alloc_pr[i]  = dest_pr;
 
                                 // 同时把对应逻辑字段的物理映射更新为新值（便于调试观测）
                                 if (dec_op[slot].alu_r) sic_packet_out[i].phy_rd <= dest_pr;
@@ -543,6 +568,8 @@ module issue_controller #(
 
                         sic_packet_out[i]       <= 'x;  // 全部弄脏
                         sic_packet_out[i].valid <= 0;  // 仅 Valid 设为明确的 0
+                    rf_alloc_wen[i] = 0;
+                    rf_alloc_pr[i]  = '0;
                     end
                 end
 

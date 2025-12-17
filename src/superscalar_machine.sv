@@ -38,16 +38,20 @@ module superscalar_machine (
     logic [0:0] issue_ecr_waddr;
     logic [1:0] issue_ecr_wdata;  // 通常为 2'b00 (Busy)
 
-    // SIC <-> Register Module (Flattened for Module Interface)
-    logic [$clog2(NUM_PHY_REGS)-1:0] reg_addr_flat[TOTAL_REG_PORTS];
-    logic reg_req_read_flat[TOTAL_REG_PORTS];
-    logic reg_req_write_flat[TOTAL_REG_PORTS];
-    logic reg_write_commit_flat[TOTAL_REG_PORTS];
-    logic [ID_WIDTH-1:0] reg_issue_id_flat[TOTAL_REG_PORTS];
-    logic reg_release_flat[TOTAL_REG_PORTS];
-    logic [31:0] reg_wdata_flat[TOTAL_REG_PORTS];
-    logic [31:0] reg_rdata_flat[TOTAL_REG_PORTS];
-    logic reg_grant_flat[TOTAL_REG_PORTS];
+    // Issue Controller -> Register File allocate (new lifecycle pulse)
+    logic                            rf_alloc_wen[NUM_SICS];
+    logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr [NUM_SICS];
+
+    // Register File (simple) <-> SIC
+    logic [$clog2(NUM_PHY_REGS)-1:0] rf_rs_addr [NUM_SICS];
+    logic [$clog2(NUM_PHY_REGS)-1:0] rf_rt_addr [NUM_SICS];
+    logic [31:0]                     rf_rs_rdata[NUM_SICS];
+    logic [31:0]                     rf_rt_rdata[NUM_SICS];
+    logic                            rf_rs_valid[NUM_SICS];
+    logic                            rf_rt_valid[NUM_SICS];
+    logic                            rf_wcommit [NUM_SICS];
+    logic [$clog2(NUM_PHY_REGS)-1:0] rf_waddr   [NUM_SICS];
+    logic [31:0]                     rf_wdata   [NUM_SICS];
 
     // SIC <-> ALU (Pool Interface)
     logic sic_alu_req[NUM_SICS];
@@ -120,7 +124,10 @@ module superscalar_machine (
         // Issue Controller 在分配 ECR 时将其置为 Busy(00)
         .ecr_reset_wen(issue_ecr_wen),
         .ecr_reset_addr(issue_ecr_waddr),
-        .ecr_reset_data(issue_ecr_wdata)
+        .ecr_reset_data(issue_ecr_wdata),
+        // Register File allocate pulse
+        .rf_alloc_wen(rf_alloc_wen),
+        .rf_alloc_pr(rf_alloc_pr)
     );
 
     // 3. SIC 阵列
@@ -205,41 +212,46 @@ module superscalar_machine (
                 .pc_redirect_issue_id(sic_pc_redirect_issue_id[i])
             );
 
-            // 连接 Reg 信号到 Flat 数组
+            // 连接到无锁寄存器文件
             always_comb begin
-                for (int p = 0; p < 3; p++) begin
-                    int idx = i * 3 + p;
-                    reg_addr_flat[idx]         = s_reg_addr[p];
-                    reg_req_read_flat[idx]     = s_reg_req_read[p];
-                    reg_req_write_flat[idx]    = s_reg_req_write[p];
-                    reg_write_commit_flat[idx] = s_reg_write_commit[p];
-                    reg_issue_id_flat[idx]     = s_reg_issue_id[p];
-                    reg_release_flat[idx]      = s_reg_release[p];
-                    reg_wdata_flat[idx]        = s_reg_wdata[p];
-                    s_reg_rdata[p]             = reg_rdata_flat[idx];
-                    s_reg_grant[p]             = reg_grant_flat[idx];
-                end
+                // Read ports
+                rf_rs_addr[i] = s_reg_addr[0];
+                rf_rt_addr[i] = s_reg_addr[1];
+                s_reg_rdata[0] = rf_rs_rdata[i];
+                s_reg_rdata[1] = rf_rt_rdata[i];
+                // grant 用作 “rvalid” 门控（SIC 会在 REQUEST_LOCKS 等待 grant）
+                s_reg_grant[0] = rf_rs_valid[i];
+                s_reg_grant[1] = rf_rt_valid[i];
+                // Write port：不再需要锁，grant 恒为 1
+                s_reg_grant[2] = 1'b1;
+                s_reg_rdata[2] = 32'b0;
+
+                // Writeback commit (dst)
+                rf_wcommit[i] = s_reg_write_commit[2] && s_reg_req_write[2];
+                rf_waddr[i]   = s_reg_addr[2];
+                rf_wdata[i]   = s_reg_wdata[2];
             end
         end
     endgenerate
 
-    // 4. 全局寄存器模块
-    register_module #(
+    // 4. 无锁寄存器文件（生命周期：issue alloc -> commit write -> reads）
+    register_file #(
         .NUM_PHY_REGS(NUM_PHY_REGS),
-        .TOTAL_PORTS(TOTAL_REG_PORTS),
-        .ID_WIDTH(ID_WIDTH)
+        .NUM_SICS    (NUM_SICS)
     ) reg_file (
         .clk(clk),
         .rst_n(rst_n),
-        .port_addr(reg_addr_flat),
-        .port_req_read(reg_req_read_flat),
-        .port_req_write(reg_req_write_flat),
-        .port_write_commit(reg_write_commit_flat),
-        .port_issue_id(reg_issue_id_flat),
-        .port_release(reg_release_flat),
-        .port_wdata(reg_wdata_flat),
-        .port_rdata_out(reg_rdata_flat),
-        .port_grant_out(reg_grant_flat)
+        .alloc_wen(rf_alloc_wen),
+        .alloc_pr (rf_alloc_pr),
+        .rs_addr  (rf_rs_addr),
+        .rt_addr  (rf_rt_addr),
+        .rs_rdata (rf_rs_rdata),
+        .rt_rdata (rf_rt_rdata),
+        .rs_valid (rf_rs_valid),
+        .rt_valid (rf_rt_valid),
+        .wcommit  (rf_wcommit),
+        .waddr    (rf_waddr),
+        .wdata    (rf_wdata)
     );
 
     // 5. 数据内存
