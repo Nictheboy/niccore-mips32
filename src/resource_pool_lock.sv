@@ -6,6 +6,9 @@
  * 2. 处理了当 NUM_RESOURCES=1 或 NUM_PORTS=1 时，$clog2 计算结果为 0 导致产生 [-1:0] 非法位宽的问题。
  * 现在当数量为 1 时，强制位宽为 1。
  */
+
+`include "structs.svh"
+
 module resource_pool_lock #(
     parameter int NUM_RESOURCES,
     parameter int NUM_PORTS,
@@ -18,9 +21,8 @@ module resource_pool_lock #(
     input logic clk,
     input logic rst_n,
 
-    input logic                req         [NUM_PORTS],
-    input logic [ID_WIDTH-1:0] req_issue_id[NUM_PORTS],
-    input logic                release_lock[NUM_PORTS],
+    // 每个 port 的输入按结构体打包
+    input rpl_req#(ID_WIDTH)::t rpl_in[NUM_PORTS],
 
     // 输出
     output logic                    grant    [NUM_PORTS],
@@ -66,7 +68,7 @@ module resource_pool_lock #(
             res_allocated[r] = owners[r].valid;
 
             if (owners[r].valid) begin
-                if (release_lock[owners[r].port_idx]) begin
+                if (rpl_in[owners[r].port_idx].release_lock) begin
                     res_allocated[r] = 0;
                     next_owners[r].valid = 0;
                 end else begin
@@ -102,14 +104,14 @@ module resource_pool_lock #(
             if (target_res != -1) begin
                 // B. 寻找未被服务的、Issue ID 最小的请求者
                 for (int p = 0; p < NUM_PORTS; p++) begin
-                    if (req[p] && !port_serviced[p]) begin
+                    if (rpl_in[p].req && !port_serviced[p]) begin
                         if (!found_candidate) begin
-                            best_id = req_issue_id[p];
+                            best_id = rpl_in[p].req_issue_id;
                             best_port = p;
                             found_candidate = 1;
                         end else begin
-                            if (is_seq_smaller(req_issue_id[p], best_id)) begin
-                                best_id   = req_issue_id[p];
+                            if (is_seq_smaller(rpl_in[p].req_issue_id, best_id)) begin
+                                best_id   = rpl_in[p].req_issue_id;
                                 best_port = p;
                             end
                         end
@@ -125,7 +127,7 @@ module resource_pool_lock #(
                     port_serviced[best_port] = 1;
                     res_allocated[target_res] = 1;
 
-                    if (!release_lock[best_port]) begin
+                    if (!rpl_in[best_port].release_lock) begin
                         next_owners[target_res].valid = 1;
                         // 【修复点 6】：使用安全位宽截断
                         next_owners[target_res].port_idx = best_port[PORT_IDX_WIDTH-1:0];

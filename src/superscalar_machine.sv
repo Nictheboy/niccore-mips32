@@ -1,3 +1,6 @@
+
+`include "structs.svh"
+
 (* dont_touch = "true" *)
 module superscalar_machine (
     input logic clk,
@@ -39,40 +42,22 @@ module superscalar_machine (
     logic [1:0] issue_ecr_wdata;  // 通常为 2'b00 (Busy)
 
     // Issue Controller -> Register File allocate (new lifecycle pulse)
-    logic                            rf_alloc_wen[NUM_SICS];
-    logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr [NUM_SICS];
+    logic rf_alloc_wen[NUM_SICS];
+    logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr[NUM_SICS];
 
-    // Register File (simple) <-> SIC
-    logic [$clog2(NUM_PHY_REGS)-1:0] rf_rs_addr [NUM_SICS];
-    logic [$clog2(NUM_PHY_REGS)-1:0] rf_rt_addr [NUM_SICS];
-    logic [31:0]                     rf_rs_rdata[NUM_SICS];
-    logic [31:0]                     rf_rt_rdata[NUM_SICS];
-    logic                            rf_rs_valid[NUM_SICS];
-    logic                            rf_rt_valid[NUM_SICS];
-    logic                            rf_wcommit [NUM_SICS];
-    logic [$clog2(NUM_PHY_REGS)-1:0] rf_waddr   [NUM_SICS];
-    logic [31:0]                     rf_wdata   [NUM_SICS];
+    // Register File (packed) <-> SIC
+    reg_req #(NUM_PHY_REGS)::t rf_req[NUM_SICS];
+    reg_ans_t rf_ans[NUM_SICS];
 
     // SIC <-> ALU (Pool Interface)
-    logic sic_alu_req[NUM_SICS];
-    logic [ID_WIDTH-1:0] sic_alu_issue[NUM_SICS];
-    logic sic_alu_rel[NUM_SICS];
-    logic [31:0] sic_alu_opa[NUM_SICS];
-    logic [31:0] sic_alu_opb[NUM_SICS];
-    logic [5:0] sic_alu_code[NUM_SICS];
-    logic [31:0] sic_alu_res[NUM_SICS];
-    logic sic_alu_zero[NUM_SICS];
-    logic sic_alu_over[NUM_SICS];
+    rpl_req #(ID_WIDTH)::t alu_rpl[NUM_SICS];
+    alu_req_t sic_alu_req[NUM_SICS];
+    alu_ans_t sic_alu_ans[NUM_SICS];
     logic sic_alu_grant[NUM_SICS];
 
-    // SIC <-> Memory
-    logic [31:0] mem_addr[NUM_SICS];
-    logic mem_req_r[NUM_SICS];
-    logic mem_req_w[NUM_SICS];
-    logic [ID_WIDTH-1:0] mem_issue[NUM_SICS];
-    logic mem_rel[NUM_SICS];
-    logic [31:0] mem_wdata[NUM_SICS];
-    logic mem_write_commit[NUM_SICS];
+    // SIC <-> Memory (packed)
+    rpl_req #(ID_WIDTH)::t mem_rpl[NUM_SICS];
+    mem_req_t mem_req[NUM_SICS];
     logic [31:0] mem_rdata[NUM_SICS];
     logic mem_grant[NUM_SICS];
 
@@ -134,17 +119,6 @@ module superscalar_machine (
     genvar i;
     generate
         for (i = 0; i < NUM_SICS; i++) begin : sics
-            // 临时 Reg 信号 (用于连接到 Flat 数组)
-            logic [$clog2(NUM_PHY_REGS)-1:0] s_reg_addr        [3];
-            logic                            s_reg_req_read    [3];
-            logic                            s_reg_req_write   [3];
-            logic                            s_reg_write_commit[3];
-            logic [            ID_WIDTH-1:0] s_reg_issue_id    [3];
-            logic                            s_reg_release     [3];
-            logic [                    31:0] s_reg_wdata       [3];
-            logic [                    31:0] s_reg_rdata       [3];
-            logic                            s_reg_grant       [3];
-
             single_instruction_controller #(
                 .SIC_ID(i),
                 .NUM_PHY_REGS(NUM_PHY_REGS),
@@ -155,38 +129,20 @@ module superscalar_machine (
                 .req_instr(sic_req_instr[i]),
                 .packet_in(sic_packets[i]),
 
-                // Reg Ports (Internal 3-port array)
-                .reg_addr(s_reg_addr),
-                .reg_req_read(s_reg_req_read),
-                .reg_req_write(s_reg_req_write),
-                .reg_write_commit(s_reg_write_commit),
-                .reg_issue_id(s_reg_issue_id),
-                .reg_release(s_reg_release),
-                .reg_wdata(s_reg_wdata),
-                .reg_rdata(s_reg_rdata),
-                .reg_grant(s_reg_grant),
+                // Reg (packed)
+                .reg_req(rf_req[i]),
+                .reg_ans(rf_ans[i]),
 
                 // Mem Port
-                .mem_addr(mem_addr[i]),
-                .mem_req_read(mem_req_r[i]),
-                .mem_req_write(mem_req_w[i]),
-                .mem_issue_id(mem_issue[i]),
-                .mem_release(mem_rel[i]),
-                .mem_wdata(mem_wdata[i]),
-                .mem_write_commit(mem_write_commit[i]),
+                .mem_rpl  (mem_rpl[i]),
+                .mem_req  (mem_req[i]),
                 .mem_rdata(mem_rdata[i]),
                 .mem_grant(mem_grant[i]),
 
                 // ALU Port (Updated)
-                .alu_req(sic_alu_req[i]),
-                .alu_issue_id(sic_alu_issue[i]),
-                .alu_release(sic_alu_rel[i]),
-                .alu_op_a(sic_alu_opa[i]),
-                .alu_op_b(sic_alu_opb[i]),
-                .alu_opcode(sic_alu_code[i]),
-                .alu_res(sic_alu_res[i]),
-                .alu_zero(sic_alu_zero[i]),
-                .alu_over(sic_alu_over[i]),
+                .alu_rpl  (alu_rpl[i]),
+                .alu_req  (sic_alu_req[i]),
+                .alu_ans  (sic_alu_ans[i]),
                 .alu_grant(sic_alu_grant[i]),
 
                 // ECR Port (Simplified)
@@ -211,26 +167,6 @@ module superscalar_machine (
                 .pc_redirect_pc(sic_pc_redirect_pc[i]),
                 .pc_redirect_issue_id(sic_pc_redirect_issue_id[i])
             );
-
-            // 连接到无锁寄存器文件
-            always_comb begin
-                // Read ports
-                rf_rs_addr[i] = s_reg_addr[0];
-                rf_rt_addr[i] = s_reg_addr[1];
-                s_reg_rdata[0] = rf_rs_rdata[i];
-                s_reg_rdata[1] = rf_rt_rdata[i];
-                // grant 用作 “rvalid” 门控（SIC 会在 REQUEST_LOCKS 等待 grant）
-                s_reg_grant[0] = rf_rs_valid[i];
-                s_reg_grant[1] = rf_rt_valid[i];
-                // Write port：不再需要锁，grant 恒为 1
-                s_reg_grant[2] = 1'b1;
-                s_reg_rdata[2] = 32'b0;
-
-                // Writeback commit (dst)
-                rf_wcommit[i] = s_reg_write_commit[2] && s_reg_req_write[2];
-                rf_waddr[i]   = s_reg_addr[2];
-                rf_wdata[i]   = s_reg_wdata[2];
-            end
         end
     endgenerate
 
@@ -239,19 +175,12 @@ module superscalar_machine (
         .NUM_PHY_REGS(NUM_PHY_REGS),
         .NUM_SICS    (NUM_SICS)
     ) reg_file (
-        .clk(clk),
-        .rst_n(rst_n),
+        .clk      (clk),
+        .rst_n    (rst_n),
         .alloc_wen(rf_alloc_wen),
         .alloc_pr (rf_alloc_pr),
-        .rs_addr  (rf_rs_addr),
-        .rt_addr  (rf_rt_addr),
-        .rs_rdata (rf_rs_rdata),
-        .rt_rdata (rf_rt_rdata),
-        .rs_valid (rf_rs_valid),
-        .rt_valid (rf_rt_valid),
-        .wcommit  (rf_wcommit),
-        .waddr    (rf_waddr),
-        .wdata    (rf_wdata)
+        .reg_req  (rf_req),
+        .reg_ans  (rf_ans)
     );
 
     // 5. 数据内存
@@ -262,13 +191,8 @@ module superscalar_machine (
     ) dmem (
         .clk(clk),
         .rst_n(rst_n),
-        .addr(mem_addr),
-        .req_read(mem_req_r),
-        .req_write(mem_req_w),
-        .req_issue_id(mem_issue),
-        .release_lock(mem_rel),
-        .write_commit(mem_write_commit),
-        .wdata(mem_wdata),
+        .rpl_req(mem_rpl),
+        .mem_req(mem_req),
         .rdata(mem_rdata),
         .grant(mem_grant)
     );
@@ -281,15 +205,9 @@ module superscalar_machine (
     ) alu_pool (
         .clk(clk),
         .rst_n(rst_n),
-        .sic_req(sic_alu_req),
-        .sic_issue_id(sic_alu_issue),
-        .sic_release(sic_alu_rel),
-        .sic_op_a(sic_alu_opa),
-        .sic_op_b(sic_alu_opb),
-        .sic_op_code(sic_alu_code),
-        .sic_res_out(sic_alu_res),
-        .sic_zero_out(sic_alu_zero),
-        .sic_over_out(sic_alu_over),
+        .sic_rpl(alu_rpl),
+        .sic_alu_req(sic_alu_req),
+        .sic_alu_ans(sic_alu_ans),
         .sic_grant_out(sic_alu_grant)
     );
 

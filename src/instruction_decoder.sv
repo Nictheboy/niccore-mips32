@@ -12,18 +12,7 @@
  * Refactored  : 2025/12/15 (Packed into structs)
  */
 
-// 1. 指令 opcode 枚举（用于更清晰的调试/上层逻辑）
-typedef enum logic [5:0] {
-    OPC_INVALID,
-    OPC_SPECIAL,
-    OPC_BEQ,
-    OPC_J,
-    OPC_JAL,
-    OPC_ORI,
-    OPC_LUI,
-    OPC_LW,
-    OPC_SW
-} opcode_t;
+`include "structs.svh"
 
 function automatic opcode_t opcode_enum(input logic [5:0] raw);
     opcode_t r;
@@ -43,24 +32,6 @@ function automatic opcode_t opcode_enum(input logic [5:0] raw);
         return r;
     end
 endfunction
-
-// 2. 指令信息结构体 (Fields & Immediates)
-typedef struct packed {
-    opcode_t     opcode;          // 指令 opcode（枚举）
-    logic        is_branch;       // 是否为分支指令（当前仅 BEQ）
-    // 字段有效性（用于发射端重命名/调试）
-    logic        rs_valid;
-    logic        rt_valid;
-    logic        rd_valid;
-    logic [4:0]  rs;
-    logic [4:0]  rt;
-    logic [4:0]  rd;
-    logic [5:0]  funct;
-    logic [15:0] imm16;
-    logic [31:0] imm16_sign_ext;
-    logic [31:0] imm16_zero_ext;
-    logic [25:0] jump_target;
-} instr_info_t;
 
 // =========================================================
 // 模块定义

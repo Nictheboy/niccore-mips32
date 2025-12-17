@@ -1,4 +1,4 @@
-module mips_tb;
+module superscalar_machine_tb;
     reg reset, clock;
     superscalar_machine superscalar_machine (
         .rst_n(~reset),

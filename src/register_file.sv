@@ -13,6 +13,8 @@
  * - Issue Controller 提供 alloc 端口：在分配新 phy_dst 时将其 valid 清 0（并可将 data 置 X）
  */
 
+`include "structs.svh"
+
 module register_file #(
     parameter int NUM_PHY_REGS = 64,
     parameter int NUM_SICS     = 2
@@ -21,33 +23,24 @@ module register_file #(
     input logic rst_n,
 
     // === Allocate / Reset lifecycle (from Issue Controller) ===
-    input logic                             alloc_wen [NUM_SICS],
-    input logic [$clog2(NUM_PHY_REGS)-1:0]  alloc_pr  [NUM_SICS],
+    input logic                            alloc_wen[NUM_SICS],
+    input logic [$clog2(NUM_PHY_REGS)-1:0] alloc_pr [NUM_SICS],
 
-    // === Read ports (from SIC) ===
-    input  logic [$clog2(NUM_PHY_REGS)-1:0] rs_addr   [NUM_SICS],
-    input  logic [$clog2(NUM_PHY_REGS)-1:0] rt_addr   [NUM_SICS],
-    output logic [31:0]                     rs_rdata  [NUM_SICS],
-    output logic [31:0]                     rt_rdata  [NUM_SICS],
-    output logic                            rs_valid  [NUM_SICS],
-    output logic                            rt_valid  [NUM_SICS],
-
-    // === Write ports (from SIC) ===
-    input logic                             wcommit   [NUM_SICS],
-    input logic [$clog2(NUM_PHY_REGS)-1:0]  waddr     [NUM_SICS],
-    input logic [31:0]                      wdata     [NUM_SICS]
+    // === SIC interface (packed) ===
+    input  reg_req#(NUM_PHY_REGS)::t reg_req[NUM_SICS],
+    output reg_ans_t                 reg_ans[NUM_SICS]
 );
 
-    logic [31:0] regs [NUM_PHY_REGS];
-    logic        vld  [NUM_PHY_REGS];
+    logic [31:0] regs[NUM_PHY_REGS];
+    logic        vld [NUM_PHY_REGS];
 
     // 组合读：直接输出数据；由 valid 提供“是否可用”
     always_comb begin
         for (int s = 0; s < NUM_SICS; s++) begin
-            rs_rdata[s] = regs[rs_addr[s]];
-            rt_rdata[s] = regs[rt_addr[s]];
-            rs_valid[s] = vld[rs_addr[s]];
-            rt_valid[s] = vld[rt_addr[s]];
+            reg_ans[s].rs_rdata = regs[reg_req[s].rs_addr];
+            reg_ans[s].rt_rdata = regs[reg_req[s].rt_addr];
+            reg_ans[s].rs_valid = vld[reg_req[s].rs_addr];
+            reg_ans[s].rt_valid = vld[reg_req[s].rt_addr];
         end
     end
 
@@ -70,21 +63,19 @@ module register_file #(
 
             // 2) commit 写回：只允许写一次
             for (int s = 0; s < NUM_SICS; s++) begin
-                if (wcommit[s]) begin
+                if (reg_req[s].wcommit) begin
 `ifndef SYNTHESIS
                     // 禁止写物理 0..31（保留初值映射），以及禁止二次写
-                    assert (waddr[s] >= 32)
-                        else $fatal(1, "RF: illegal write to reserved pr=%0d", waddr[s]);
-                    assert (vld[waddr[s]] == 1'b0)
-                        else $fatal(1, "RF: double-write to pr=%0d", waddr[s]);
+                    assert (reg_req[s].waddr >= 32)
+                    else $fatal(1, "RF: illegal write to reserved pr=%0d", reg_req[s].waddr);
+                    assert (vld[reg_req[s].waddr] == 1'b0)
+                    else $fatal(1, "RF: double-write to pr=%0d", reg_req[s].waddr);
 `endif
-                    regs[waddr[s]] <= wdata[s];
-                    vld[waddr[s]]  <= 1'b1;
+                    regs[reg_req[s].waddr] <= reg_req[s].wdata;
+                    vld[reg_req[s].waddr]  <= 1'b1;
                 end
             end
         end
     end
 
 endmodule
-
-

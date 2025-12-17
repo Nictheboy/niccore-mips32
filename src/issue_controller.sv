@@ -1,28 +1,5 @@
-typedef struct packed {
-    logic        valid;         // 指令有效位
-    logic [31:0] pc;            // 当前指令 PC
-    logic [31:0] next_pc_pred;  // 预测的下一条 PC (用于 JAL/Branch)
 
-    // 锁与排序
-    logic [15:0] issue_id;  // 发射序号 (假设 16位宽)
-
-    // 解码信息
-    instr_info_t info;
-
-    // 寄存器重命名结果 (物理寄存器号)
-    // 说明：
-    // - phy_rs/phy_rt/phy_rd：对应“逻辑字段 rs/rt/rd”的物理映射（仅用于执行/调试）
-    // - phy_dst：本指令真正要写回的目的物理寄存器（SIC 写端口使用它）
-    logic [5:0] phy_rs;   // rs 字段映射；无意义则为 'x
-    logic [5:0] phy_rt;   // rt 字段映射；无意义则为 'x
-    logic [5:0] phy_rd;   // rd 字段映射；无意义则为 'x
-    logic [5:0] phy_dst;  // 目的寄存器映射；无写回则为 'x
-
-    // 分支预测与 ECR
-    logic       pred_taken;  // 预测跳转方向
-    logic [1:0] dep_ecr_id;  // 依赖的 ECR 号 (0 为无依赖)
-    logic [1:0] set_ecr_id;  // 本指令需要设置的 ECR 号 (0 为不设置)
-} sic_packet_t;
+`include "structs.svh"
 
 module issue_controller #(
     parameter int NUM_SICS,

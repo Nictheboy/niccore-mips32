@@ -4,14 +4,14 @@
  * Modified    : Parameterized version
  */
 
+`include "structs.svh"
+
 module data_memory #(
     parameter MEM_DEPTH = 2048  // 改为 parameter，默认值保持 2048
 ) (
     input reset,
     input clock,
-    input [31:2] address,
-    input write_enable,
-    input [31:0] write_input,
+    input mem_req_t mem_req,
     output reg [31:0] read_result
 );
     // 自动计算所需的地址线位宽 (例如 2048 -> 11)
@@ -20,11 +20,11 @@ module data_memory #(
     reg [31:0] data[MEM_DEPTH-1 : 0];  // 数组大小改为参数控制
 
     // 地址计算逻辑微调：[VALID_ADDRESS_WIDTH+2-1 : 2] 等价于 [VALID_ADDRESS_WIDTH+1 : 2]
-    wire [VALID_ADDRESS_WIDTH-1 : 0] valid_address = address[VALID_ADDRESS_WIDTH+1 : 2];
+    wire [VALID_ADDRESS_WIDTH-1 : 0] valid_address = mem_req.addr[VALID_ADDRESS_WIDTH+1 : 2];
 
     // 验证逻辑保持不变：检查除去有效位之外的高位是否全为0
     // 输入地址是 [31:2]，共 30 bit。
-    wire address_is_valid = (address == {{(30 - VALID_ADDRESS_WIDTH) {1'b0}}, valid_address});
+    wire address_is_valid = (mem_req.addr == {{(30 - VALID_ADDRESS_WIDTH) {1'b0}}, valid_address});
 
     always @(*) begin
         if (address_is_valid) begin
@@ -40,8 +40,8 @@ module data_memory #(
             for (i = 0; i < MEM_DEPTH; i = i + 1) begin  // 循环上限改为参数
                 data[i] <= 32'h00000000;
             end
-        end else if (write_enable && address_is_valid) begin
-            data[valid_address] <= write_input;
+        end else if (mem_req.wen && address_is_valid) begin
+            data[valid_address] <= mem_req.wdata;
         end
     end
 

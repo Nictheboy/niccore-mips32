@@ -1,3 +1,6 @@
+
+`include "structs.svh"
+
 module single_instruction_controller #(
     parameter int SIC_ID,
     parameter int NUM_PHY_REGS,
@@ -10,41 +13,21 @@ module single_instruction_controller #(
     output logic        req_instr,
     input  sic_packet_t packet_in,
 
-    // 与 Register Module 交互 (3 个端口: 0,1读, 2写)
-    // 端口索引是相对于 SIC 的 (0, 1, 2)
-    output logic [$clog2(NUM_PHY_REGS)-1:0] reg_addr        [3],
-    output logic                            reg_req_read    [3],
-    output logic                            reg_req_write   [3],
-    // 写提交：只在真正提交写回的那个周期拉高
-    output logic                            reg_write_commit[3],
-    output logic [            ID_WIDTH-1:0] reg_issue_id    [3],
-    output logic                            reg_release     [3],
-    output logic [                    31:0] reg_wdata       [3],
-    input  logic [                    31:0] reg_rdata       [3],
-    input  logic                            reg_grant       [3],
+    // 与 Register File 交互（打包接口）
+    output reg_req#(NUM_PHY_REGS)::t reg_req,
+    input  reg_ans_t                 reg_ans,
 
-    // 与 Memory 交互
-    output logic [        31:0] mem_addr,
-    output logic                mem_req_read,
-    output logic                mem_req_write,
-    output logic [ID_WIDTH-1:0] mem_issue_id,
-    output logic                mem_release,
-    output logic [        31:0] mem_wdata,
-    output logic                mem_write_commit,
-    input  logic [        31:0] mem_rdata,
-    input  logic                mem_grant,
+    // 与 Memory 交互（打包接口）
+    output rpl_req#(ID_WIDTH)::t        mem_rpl,
+    output mem_req_t                    mem_req,
+    input  logic                 [31:0] mem_rdata,
+    input  logic                        mem_grant,
 
     // 与 ALU 交互
-    output logic                alu_req,
-    output logic [ID_WIDTH-1:0] alu_issue_id,
-    output logic                alu_release,
-    output logic [        31:0] alu_op_a,
-    output logic [        31:0] alu_op_b,
-    output logic [         5:0] alu_opcode,
-    input  logic [        31:0] alu_res,
-    input  logic                alu_zero,
-    input  logic                alu_over,
-    input  logic                alu_grant,
+    output rpl_req#(ID_WIDTH)::t alu_rpl,
+    output alu_req_t             alu_req,
+    input  alu_ans_t             alu_ans,
+    input  logic                 alu_grant,
 
     // 与 ECR 交互 (简化接口)
     // 读接口：直接输出地址，组合逻辑读取
@@ -87,6 +70,8 @@ module single_instruction_controller #(
     logic [31:0] op_a_val, op_b_val, result_val;
     logic zero_val;
     logic locks_acquired;
+    logic [31:0] mem_addr_hold;  // byte addr
+    logic [31:0] mem_wdata_hold;
 
     // 指令分类（由 info.opcode + funct 推导，供 always_comb/always_ff 共用）
     logic op_alu_r, op_ori, op_lui, op_lw, op_sw, op_beq, op_j, op_jal, op_jr, op_syscall;
@@ -98,6 +83,13 @@ module single_instruction_controller #(
 
     // REQUEST_LOCKS 阶段的 grant 聚合（避免在 always_ff 里声明局部变量触发 Vivado 警告）
     logic all_granted;
+
+    // release_lock 需要是单周期脉冲（由时序逻辑产生），通过结构体输出给资源池锁
+    logic mem_release_pulse;
+    logic alu_release_pulse;
+
+    // Reg 写回数据保持（在 CHECK_ECR 提前准备，COMMIT_WRITE 只拉高 wcommit）
+    logic [31:0] reg_wdata_dst;
 
     // 组合逻辑计算锁请求
     always_comb begin
@@ -124,46 +116,40 @@ module single_instruction_controller #(
         // 当前 ALU 仅用于：R-Type / ORI / BEQ。LUI/LW/SW 由内部简单逻辑完成（避免不必要的 ALU 锁）
         need_alu = (op_alu_r || op_ori || op_beq);
 
-        // 默认全 0
-        reg_req_read[0] = 0;
-        reg_req_read[1] = 0;
-        reg_req_read[2] = 0;
-        reg_req_write[0] = 0;
-        reg_req_write[1] = 0;
-        reg_req_write[2] = 0;
-        reg_write_commit[0] = 0;
-        reg_write_commit[1] = 0;
-        reg_write_commit[2] = 0;
-        mem_req_read = 0;
-        mem_req_write = 0;
-        alu_req = 0;
-        mem_write_commit = 0;
+        // 默认：寄存器文件不写回
+        reg_req = '0;
+        mem_req = '0;
 
-        reg_addr[0] = pkt.phy_rs;
-        reg_addr[1] = pkt.phy_rt;
-        reg_addr[2] = pkt.phy_dst;
+        // 资源池锁结构体默认输出
+        mem_rpl.req = 0;
+        mem_rpl.req_issue_id = pkt.issue_id;
+        mem_rpl.release_lock = mem_release_pulse;
+        alu_rpl.req = 0;
+        alu_rpl.req_issue_id = pkt.issue_id;
+        alu_rpl.release_lock = alu_release_pulse;
 
-        // 读锁：读到操作数就可以释放，所以只在 REQUEST_LOCKS/EXECUTE_READ 阶段请求
-        if (state == REQUEST_LOCKS || state == EXECUTE_READ) begin
-            reg_req_read[0] = need_reg_read0;
-            reg_req_read[1] = need_reg_read1;
-        end
+        // 读地址直连（不需要 req 信号；可用性用 reg_ans.*_valid 表示）
+        reg_req.rs_addr = pkt.phy_rs;
+        reg_req.rt_addr = pkt.phy_rt;
+        // 写端口：地址/数据先给出，实际写由 wcommit 决定
+        reg_req.waddr = pkt.phy_dst;
+        reg_req.wdata = reg_wdata_dst;
 
-        // 写锁/外部资源：需要持有到提交或回滚，所以在整个关键区间持续请求
+        // 外部资源：需要持有到提交或回滚，所以在整个关键区间持续请求
         if (state == REQUEST_LOCKS || state == EXECUTE_READ || state == CHECK_ECR || state == COMMIT_WRITE) begin
-            reg_req_write[2] = need_reg_write2;
-            mem_req_read     = need_mem_read;
-            mem_req_write    = need_mem_write;
-            alu_req          = need_alu;
+            mem_rpl.req = (need_mem_read || need_mem_write);
+            alu_rpl.req = need_alu;
         end
+
+        // 组装 mem_req：地址/数据来自 hold 寄存器，写使能仅在提交点拉高
+        mem_req.addr  = mem_addr_hold[31:2];
+        mem_req.wdata = mem_wdata_hold;
+        mem_req.wen   = (state == COMMIT_WRITE) && op_sw;
 
         // 仅在提交写回状态，且确实是写寄存器类指令时，拉高 commit
         if (state == COMMIT_WRITE) begin
             if (op_alu_r || op_lw || op_ori || op_lui || op_jal) begin
-                reg_write_commit[2] = 1;
-            end
-            if (op_sw) begin
-                mem_write_commit = 1;
+                reg_req.wcommit = need_reg_write2;
             end
         end
     end
@@ -172,21 +158,12 @@ module single_instruction_controller #(
     always_comb begin
         all_granted = 1;
         if (state == REQUEST_LOCKS) begin
-            if (reg_req_read[0] && !reg_grant[0]) all_granted = 0;
-            if (reg_req_read[1] && !reg_grant[1]) all_granted = 0;
-            if (reg_req_write[2] && !reg_grant[2]) all_granted = 0;
-            if (mem_req_read && !mem_grant) all_granted = 0;
-            if (mem_req_write && !mem_grant) all_granted = 0;
-            if (alu_req && !alu_grant) all_granted = 0;
+            if (need_reg_read0 && !reg_ans.rs_valid) all_granted = 0;
+            if (need_reg_read1 && !reg_ans.rt_valid) all_granted = 0;
+            if (mem_rpl.req && !mem_grant) all_granted = 0;
+            if (alu_rpl.req && !alu_grant) all_granted = 0;
         end
     end
-
-    // 发射 ID 赋值
-    assign reg_issue_id[0] = pkt.issue_id;
-    assign reg_issue_id[1] = pkt.issue_id;
-    assign reg_issue_id[2] = pkt.issue_id;
-    assign mem_issue_id    = pkt.issue_id;
-    assign alu_issue_id    = pkt.issue_id;
 
     // ECR 读地址：统一采用 0-based 编号（ECR0=0, ECR1=1）
     assign ecr_read_addr = pkt.dep_ecr_id[$clog2(2)-1:0];
@@ -203,20 +180,21 @@ module single_instruction_controller #(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
-            reg_release <= '{0, 0, 0};
-            mem_release <= 0;
-            alu_release <= 0;
+            mem_release_pulse <= 0;
+            alu_release_pulse <= 0;
             ecr_wen <= 0;
             bp_update_en <= 0;
-            reg_wdata <= '{default: 32'b0};
+            reg_wdata_dst <= 32'b0;
+            mem_addr_hold <= 32'b0;
+            mem_wdata_hold <= 32'b0;
+            alu_req <= '0;
             pc_redirect_valid <= 0;
             pc_redirect_pc <= 32'b0;
             pc_redirect_issue_id <= '0;
         end else begin
             // 默认清除 Release 信号 (Release 仅维持一个周期)
-            reg_release       <= '{0, 0, 0};
-            mem_release       <= 0;
-            alu_release       <= 0;
+            mem_release_pulse <= 0;
+            alu_release_pulse <= 0;
             ecr_wen           <= 0;
             bp_update_en      <= 0;
             pc_redirect_valid <= 0;
@@ -247,53 +225,45 @@ module single_instruction_controller #(
                     // 锁已持有，读取数据是瞬时的 (Flash Read)
                     // 准备操作数
                     if (op_alu_r) begin
-                        op_a_val   <= reg_rdata[0];
-                        op_b_val   <= reg_rdata[1];
-                        alu_opcode <= pkt.info.funct;
-                        // 关键修复：ALU 输入不要转发 op_*_val（同一拍会拿到旧值），直接用 reg_rdata
-                        alu_op_a   <= reg_rdata[0];
-                        alu_op_b   <= reg_rdata[1];
+                        op_a_val   <= reg_ans.rs_rdata;
+                        op_b_val   <= reg_ans.rt_rdata;
+                        alu_req.op <= pkt.info.funct;
+                        // 关键修复：ALU 输入不要转发 op_*_val（同一拍会拿到旧值），直接用寄存器读数据
+                        alu_req.a  <= reg_ans.rs_rdata;
+                        alu_req.b  <= reg_ans.rt_rdata;
                     end else if (op_ori) begin
-                        op_a_val   <= reg_rdata[0];
+                        op_a_val   <= reg_ans.rs_rdata;
                         op_b_val   <= pkt.info.imm16_zero_ext;
-                        alu_opcode <= 6'h25;  // OR
-                        alu_op_a   <= reg_rdata[0];
-                        alu_op_b   <= pkt.info.imm16_zero_ext;
+                        alu_req.op <= 6'h25;  // OR
+                        alu_req.a  <= reg_ans.rs_rdata;
+                        alu_req.b  <= pkt.info.imm16_zero_ext;
                     end else if (op_beq) begin
-                        op_a_val   <= reg_rdata[0];
-                        op_b_val   <= reg_rdata[1];
-                        alu_opcode <= 6'h22;  // SUB (Check Zero)
-                        alu_op_a   <= reg_rdata[0];
-                        alu_op_b   <= reg_rdata[1];
+                        op_a_val   <= reg_ans.rs_rdata;
+                        op_b_val   <= reg_ans.rt_rdata;
+                        alu_req.op <= 6'h22;  // SUB (Check Zero)
+                        alu_req.a  <= reg_ans.rs_rdata;
+                        alu_req.b  <= reg_ans.rt_rdata;
                     end else if (op_lw || op_sw) begin
                         // 地址计算（内部加法，不走 ALU 资源池）
-                        op_a_val  <= reg_rdata[0];  // base
-                        op_b_val  <= reg_rdata[1];  // store data (sw)
-                        mem_addr  <= reg_rdata[0] + pkt.info.imm16_sign_ext;  // byte addr
-                        mem_wdata <= reg_rdata[1];
+                        op_a_val <= reg_ans.rs_rdata;  // base
+                        op_b_val <= reg_ans.rt_rdata;  // store data (sw)
+                        mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
+                        mem_wdata_hold <= reg_ans.rt_rdata;
                         // 不使用 ALU 资源池，避免遗留旧值造成波形困惑
-                        alu_op_a  <= 32'b0;
-                        alu_op_b  <= 32'b0;
+                        alu_req <= '0;
                     end else if (op_lui) begin
                         // LUI 无需读寄存器
                         // 保持 op_a/op_b 不用
-                        alu_op_a <= 32'b0;
-                        alu_op_b <= 32'b0;
+                        alu_req <= '0;
                     end else if (op_jal) begin
                         // JAL 无需读寄存器，写回在 CHECK_ECR 准备
-                        alu_op_a <= 32'b0;
-                        alu_op_b <= 32'b0;
+                        alu_req <= '0;
                     end else if (op_jr) begin
                         // JR 需要读取 rs 作为跳转目标
-                        op_a_val <= reg_rdata[0];
-                        alu_op_a <= 32'b0;
-                        alu_op_b <= 32'b0;
+                        op_a_val <= reg_ans.rs_rdata;
+                        alu_req  <= '0;
                     end
                     // ... 其他指令解码到 ALU Opcode ...
-
-                    // 读完寄存器操作数即可释放读锁（避免长时间占用）
-                    if (need_reg_read0) reg_release[0] <= 1;
-                    if (need_reg_read1) reg_release[1] <= 1;
 
                     // 可以在这里等待 ALU 结果稳定，或假设单周期
                     state <= CHECK_ECR;
@@ -301,8 +271,8 @@ module single_instruction_controller #(
 
                 CHECK_ECR: begin
                     // 保存计算结果
-                    result_val <= alu_res;
-                    zero_val   <= alu_zero;
+                    result_val <= alu_ans.c;
+                    zero_val   <= alu_ans.zero;
 
                     // 检查依赖的 ECR
                     // ecr_read_data 是组合逻辑输出，直接可用
@@ -314,17 +284,17 @@ module single_instruction_controller #(
                         // 预测正确，继续
                         // 关键：提前准备好写回数据，使其在 COMMIT_WRITE 的时钟沿稳定
                         if (op_alu_r || op_ori) begin
-                            reg_wdata[2] <= alu_res;
+                            reg_wdata_dst <= alu_ans.c;
                         end
                         if (op_lui) begin
-                            reg_wdata[2] <= {pkt.info.imm16, 16'b0};
+                            reg_wdata_dst <= {pkt.info.imm16, 16'b0};
                         end
                         if (op_jal) begin
                             // 约定：无延迟槽，link = PC+4
-                            reg_wdata[2] <= pkt.pc + 32'd4;
+                            reg_wdata_dst <= pkt.pc + 32'd4;
                         end
                         if (op_lw) begin
-                            reg_wdata[2] <= mem_rdata;
+                            reg_wdata_dst <= mem_rdata;
                         end
                         state <= COMMIT_WRITE;
                     end
@@ -334,8 +304,8 @@ module single_instruction_controller #(
                 COMMIT_WRITE: begin
                     // 执行写操作 (写 Reg 或 Mem 或 ECR)
 
-                    // 寄存器写回由 reg_write_commit[2] + reg_wdata[2] 在本周期时钟沿完成
-                    // reg_wdata 已在 CHECK_ECR 中提前准备好，这里不再修改它，避免时序错拍
+                    // 寄存器写回由 reg_req.wcommit + reg_req.wdata 在本周期时钟沿完成
+                    // reg_wdata_dst 已在 CHECK_ECR 中提前准备好，这里不再修改它，避免时序错拍
 
                     if (op_beq) begin
                         // 判断分支结果
@@ -379,11 +349,8 @@ module single_instruction_controller #(
                     // 发出释放信号
                     // 注意：这里不能依赖 reg_req_*/mem_req_*/alu_req，
                     // 因为这些 req 信号在 RELEASE 状态会被组合逻辑门控为 0。
-                    if (need_reg_read0) reg_release[0] <= 1;
-                    if (need_reg_read1) reg_release[1] <= 1;
-                    if (need_reg_write2) reg_release[2] <= 1;
-                    if (need_mem_read || need_mem_write) mem_release <= 1;
-                    if (need_alu) alu_release <= 1;
+                    if (need_mem_read || need_mem_write) mem_release_pulse <= 1;
+                    if (need_alu) alu_release_pulse <= 1;
                     // ECR 不再需要释放信号
 
                     state <= IDLE;
