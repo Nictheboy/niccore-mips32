@@ -9,7 +9,11 @@
 module resource_pool_lock #(
     parameter int NUM_RESOURCES,
     parameter int NUM_PORTS,
-    parameter int ID_WIDTH
+    parameter int ID_WIDTH,
+    // Vivado 兼容：端口列表里不能引用在模块体内才声明的 localparam
+    // 所以把安全位宽计算提升为参数（可依赖前面的参数）
+    parameter int RES_ID_WIDTH   = (NUM_RESOURCES > 1) ? $clog2(NUM_RESOURCES) : 1,
+    parameter int PORT_IDX_WIDTH = (NUM_PORTS > 1) ? $clog2(NUM_PORTS) : 1
 ) (
     input logic clk,
     input logic rst_n,
@@ -20,22 +24,13 @@ module resource_pool_lock #(
 
     // 输出
     output logic                    grant    [NUM_PORTS],
-    // 【修复点 1】：使用计算好的安全位宽
     output logic [RES_ID_WIDTH-1:0] alloc_id [NUM_PORTS],
     output logic                    pool_busy
 );
 
-    // =========================================================================
-    // 【修复点 2】：安全位宽计算 (Safe Width Calculation)
-    // 如果数量 > 1，使用 $clog2；如果数量 == 1，强制位宽为 1 (范围 [0:0])
-    // =========================================================================
-    localparam int RES_ID_WIDTH = (NUM_RESOURCES > 1) ? $clog2(NUM_RESOURCES) : 1;
-    localparam int PORT_IDX_WIDTH = (NUM_PORTS > 1) ? $clog2(NUM_PORTS) : 1;
-
     // 资源持有者状态表
     typedef struct packed {
         logic valid;
-        // 【修复点 3】：使用安全位宽
         logic [PORT_IDX_WIDTH-1:0] port_idx;
     } res_owner_t;
 

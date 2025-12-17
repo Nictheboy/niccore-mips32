@@ -7,8 +7,7 @@ typedef struct packed {
     logic [15:0] issue_id;  // 发射序号 (假设 16位宽)
 
     // 解码信息
-    decoded_info_t info;
-    op_flags_t     op;
+    instr_info_t info;
 
     // 寄存器重命名结果 (物理寄存器号)
     // 说明：
@@ -20,7 +19,6 @@ typedef struct packed {
     logic [5:0] phy_dst;  // 目的寄存器映射；无写回则为 'x
 
     // 分支预测与 ECR
-    logic       is_branch;   // 是否为分支指令
     logic       pred_taken;  // 预测跳转方向
     logic [1:0] dep_ecr_id;  // 依赖的 ECR 号 (0 为无依赖)
     logic [1:0] set_ecr_id;  // 本指令需要设置的 ECR 号 (0 为不设置)
@@ -55,13 +53,12 @@ module issue_controller #(
     output logic       rollback_trigger,     // 调试/监控用
 
     // ECR 写接口：用于在分配 ECR 时将其置为 Busy (00)
-    output logic       ecr_reset_wen,
+    output logic ecr_reset_wen,
     output logic [0:0] ecr_reset_addr,  // 假设 2 个 ECR，地址宽度为 1
-    output logic [1:0] ecr_reset_data   // 固定为 2'b00 (Busy)
-    ,
-    // === Register File Allocate (to register_file) ===
-    output logic                             rf_alloc_wen[NUM_SICS],
-    output logic [$clog2(NUM_PHY_REGS)-1:0]  rf_alloc_pr [NUM_SICS]
+    output logic [1:0] ecr_reset_data  // 固定为 2'b00 (Busy)
+    ,  // === Register File Allocate (to register_file) ===
+    output logic rf_alloc_wen[NUM_SICS],
+    output logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr[NUM_SICS]
 );
 
     // PC 管理
@@ -103,11 +100,7 @@ module issue_controller #(
     logic pred_taken_w[NUM_SICS];
 
     // 内部解码连线（索引同样是取指槽位 slot）
-    op_flags_t dec_op[NUM_SICS];
-    decoded_info_t dec_info[NUM_SICS];
-    logic dec_rs_valid[NUM_SICS];
-    logic dec_rt_valid[NUM_SICS];
-    logic dec_rd_valid[NUM_SICS];
+    instr_info_t dec_info[NUM_SICS];
 
     // 实例化解码器组
     genvar k;
@@ -115,11 +108,7 @@ module issue_controller #(
         for (k = 0; k < NUM_SICS; k++) begin : decoders
             instruction_decoder idec (
                 .instr(imem_data[k]),
-                .op(dec_op[k]),
-                .info(dec_info[k]),
-                .rs_valid(dec_rs_valid[k]),
-                .rt_valid(dec_rt_valid[k]),
-                .rd_valid(dec_rd_valid[k])
+                .info (dec_info[k])
             );
 
             // 分支预测查询
@@ -370,11 +359,38 @@ module issue_controller #(
                     dest_pr  = '0;
 
                     // 判断是否发射：请求指令 + 无跳转 + 无 Stall
-                    if (sic_req_instr[i] && !branch_taken_in_packet && !issue_stall) begin
+                    if (sic_req_instr[i] && !branch_taken_in_packet && !issue_stall) begin : issue_block
+                        // Vivado 兼容：该 begin/end 内的声明必须在最前面
+                        int slot;
+                        int alloc_pr;
+                        logic [$clog2(NUM_PHY_REGS)-1:0] old_pr;
+                        logic
+                            is_alu_r,
+                            is_ori,
+                            is_lui,
+                            is_lw,
+                            is_sw,
+                            is_beq,
+                            is_j,
+                            is_jal,
+                            is_jr,
+                            is_syscall;
+
                         // 关键：为“请求指令的 SIC”分配一个连续的取指槽位 slot，
                         // 解码/预测/PC 都以 slot 为准，而不是以 SIC 编号 i 为准。
-                        int slot;
                         slot = instructions_issued_this_cycle;
+                        alloc_pr = -1;
+                        old_pr = '0;
+                        is_alu_r = 0;
+                        is_ori = 0;
+                        is_lui = 0;
+                        is_lw = 0;
+                        is_sw = 0;
+                        is_beq = 0;
+                        is_j = 0;
+                        is_jal = 0;
+                        is_jr = 0;
+                        is_syscall = 0;
 
                         // === 1. 发射逻辑 ===
                         sic_packet_out[i].valid <= 1;
@@ -386,9 +402,8 @@ module issue_controller #(
                         sic_packet_out[i].issue_id <= global_issue_id + ID_WIDTH'(slot);
 
                         // 解码信息透传
-                        sic_packet_out[i].op <= dec_op[slot];
                         sic_packet_out[i].info <= dec_info[slot];
-                        sic_packet_out[i].is_branch <= (dec_op[slot].beq);
+                        // is_branch 已迁移到 info 内，由 instruction_decoder 产生
                         sic_packet_out[i].pred_taken <= pred_taken_w[slot];
                         sic_packet_out[i].dep_ecr_id <= current_active_ecr;
 
@@ -396,15 +411,15 @@ module issue_controller #(
                         // 寄存器字段映射（按 decoder 的 rs/rt/rd_valid 决定是否有意义）
                         // 约定：若字段无意义，则对应物理号置为 'x 便于调试
                         // =========================================================
-                        if (dec_rs_valid[slot])
+                        if (dec_info[slot].rs_valid)
                             sic_packet_out[i].phy_rs <= rat_work[dec_info[slot].rs];
                         else sic_packet_out[i].phy_rs <= 'x;
 
-                        if (dec_rt_valid[slot])
+                        if (dec_info[slot].rt_valid)
                             sic_packet_out[i].phy_rt <= rat_work[dec_info[slot].rt];
                         else sic_packet_out[i].phy_rt <= 'x;
 
-                        if (dec_rd_valid[slot])
+                        if (dec_info[slot].rd_valid)
                             sic_packet_out[i].phy_rd <= rat_work[dec_info[slot].rd];
                         else sic_packet_out[i].phy_rd <= 'x;
 
@@ -416,20 +431,31 @@ module issue_controller #(
                         // 规则：在同一个“无分支隔断”的发射窗口内，每次写同一逻辑寄存器都会分配新的物理寄存器，
                         // 且后续指令读取应看到最新映射（使用 rat_work 滚动更新）。
                         // =========================================================
-                        has_dest = (dec_op[slot].alu_r || dec_op[slot].ori || dec_op[slot].lui || dec_op[slot].lw || dec_op[slot].jal);
+                        // 指令分类（由 info.opcode + funct 推导）
+                        is_ori = (dec_info[slot].opcode == OPC_ORI);
+                        is_lui = (dec_info[slot].opcode == OPC_LUI);
+                        is_lw = (dec_info[slot].opcode == OPC_LW);
+                        is_sw = (dec_info[slot].opcode == OPC_SW);
+                        is_beq = (dec_info[slot].opcode == OPC_BEQ);
+                        is_j = (dec_info[slot].opcode == OPC_J);
+                        is_jal = (dec_info[slot].opcode == OPC_JAL);
+                        is_alu_r   = (dec_info[slot].opcode == OPC_SPECIAL) &&
+                                 ((dec_info[slot].funct == 6'h21) || (dec_info[slot].funct == 6'h23));
+                        is_jr      = (dec_info[slot].opcode == OPC_SPECIAL) && (dec_info[slot].funct == 6'h08);
+                        is_syscall = (dec_info[slot].opcode == OPC_SPECIAL) && (dec_info[slot].funct == 6'h0c);
+
+                        has_dest = (is_alu_r || is_ori || is_lui || is_lw || is_jal);
                         dest_lr = 5'd0;
 
-                        if (dec_op[slot].alu_r) begin
+                        if (is_alu_r) begin
                             dest_lr = dec_info[slot].rd;
-                        end else if (dec_op[slot].jal) begin
+                        end else if (is_jal) begin
                             dest_lr = 5'd31;
-                        end else if (dec_op[slot].ori || dec_op[slot].lui || dec_op[slot].lw) begin
+                        end else if (is_ori || is_lui || is_lw) begin
                             dest_lr = dec_info[slot].rt;
                         end
 
                         if (has_dest && (dest_lr != 0)) begin
-                            int alloc_pr;
-                            alloc_pr = -1;
                             // 只从 32..NUM_PHY_REGS-1 里分配（0..31 保留给架构初始映射）
                             for (int pr = 32; pr < NUM_PHY_REGS; pr++) begin
                                 if (free_bitmap_work[pr]) begin
@@ -445,7 +471,6 @@ module issue_controller #(
                                 issue_stall = 1;
                             end else begin
                                 // 记录旧版本物理寄存器，等全空闲时再回收（最简单且安全）
-                                logic [$clog2(NUM_PHY_REGS)-1:0] old_pr;
                                 old_pr = rat_work[dest_lr];
                                 if (old_pr >= 32) begin
                                     pending_free_work[pending_free_cnt_work] = old_pr;
@@ -456,13 +481,13 @@ module issue_controller #(
                                 free_bitmap_work[alloc_pr] = 1'b0;
                                 dest_pr = alloc_pr[$clog2(NUM_PHY_REGS)-1:0];
                                 sic_packet_out[i].phy_dst <= dest_pr;
-                            // 发出“开启新生命周期”脉冲给寄存器文件
-                            rf_alloc_wen[i] = 1;
-                            rf_alloc_pr[i]  = dest_pr;
+                                // 发出“开启新生命周期”脉冲给寄存器文件
+                                rf_alloc_wen[i] = 1;
+                                rf_alloc_pr[i]  = dest_pr;
 
                                 // 同时把对应逻辑字段的物理映射更新为新值（便于调试观测）
-                                if (dec_op[slot].alu_r) sic_packet_out[i].phy_rd <= dest_pr;
-                                else if (dec_op[slot].ori || dec_op[slot].lui || dec_op[slot].lw)
+                                if (is_alu_r) sic_packet_out[i].phy_rd <= dest_pr;
+                                else if (is_ori || is_lui || is_lw)
                                     sic_packet_out[i].phy_rt <= dest_pr;
 
                                 // 更新工作 RAT，供后续同周期指令读取
@@ -472,7 +497,7 @@ module issue_controller #(
                         end
 
                         // 分支/跳转与 ECR
-                        if (dec_op[slot].beq) begin
+                        if (is_beq) begin
                             logic [ 1:0] next_ecr_candidate;
                             logic [31:0] current_instr_pc;
                             logic [31:0] branch_target;
@@ -526,7 +551,7 @@ module issue_controller #(
                                     saved_alt_pc[next_ecr_candidate] <= branch_target;
                                 end
                             end
-                        end else if (dec_op[slot].j || dec_op[slot].jal) begin
+                        end else if (is_j || is_jal) begin
                             // J/JAL：目标地址在发射端即可确定，直接改变取指 PC，并截断本包后续发射
                             logic [31:0] current_instr_pc;
                             logic [31:0] jump_target;
@@ -537,7 +562,7 @@ module issue_controller #(
                             sic_packet_out[i].next_pc_pred <= jump_target;
                             next_cycle_pc = jump_target;
                             branch_taken_in_packet = 1;
-                        end else if (dec_op[slot].jr) begin
+                        end else if (is_jr) begin
                             // JR：目标地址需要等待 SIC 读取寄存器后提交
                             // 这里停止继续发射，直到收到 pc_redirect
                             jr_issued_this_cycle = 1;
@@ -568,8 +593,8 @@ module issue_controller #(
 
                         sic_packet_out[i]       <= 'x;  // 全部弄脏
                         sic_packet_out[i].valid <= 0;  // 仅 Valid 设为明确的 0
-                    rf_alloc_wen[i] = 0;
-                    rf_alloc_pr[i]  = '0;
+                        rf_alloc_wen[i] = 0;
+                        rf_alloc_pr[i]  = '0;
                     end
                 end
 
