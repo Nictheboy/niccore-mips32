@@ -90,21 +90,32 @@ module single_instruction_controller #(
 
     // Whether this SIC is currently holding a valid packet (so it should advertise PR usage).
     logic holding_pkt;
-    assign holding_pkt = (state != IDLE) && (state != WAIT_PACKET);
+    // IMPORTANT:
+    // We must advertise PR usage as soon as we have a valid packet, even in WAIT_PACKET.
+    // Otherwise the register_file's pr_not_idle bitmap misses 1 cycle and the allocator may
+    // mistakenly reuse a PR that is already being read by this SIC.
+    assign holding_pkt = (state != IDLE) && ((state != WAIT_PACKET) || packet_in.valid);
 
     // 组合逻辑计算锁请求
     always_comb begin
-        op_ori = (pkt.info.opcode == OPC_ORI);
-        op_lui = (pkt.info.opcode == OPC_LUI);
-        op_lw = (pkt.info.opcode == OPC_LW);
-        op_sw = (pkt.info.opcode == OPC_SW);
-        op_beq = (pkt.info.opcode == OPC_BEQ);
-        op_j = (pkt.info.opcode == OPC_J);
-        op_jal = (pkt.info.opcode == OPC_JAL);
-        op_alu_r = (pkt.info.opcode == OPC_SPECIAL) &&
-                   ((pkt.info.funct == 6'h21) || (pkt.info.funct == 6'h23));
-        op_jr = (pkt.info.opcode == OPC_SPECIAL) && (pkt.info.funct == 6'h08);
-        op_syscall = (pkt.info.opcode == OPC_SPECIAL) && (pkt.info.funct == 6'h0c);
+        // Packet view:
+        // - In WAIT_PACKET, pkt has not been latched yet (pkt <= packet_in happens on the clock edge),
+        //   but packet_in.valid indicates a real instruction is present right now.
+        // - Use packet_in in that one-cycle window so we can correctly advertise PR usage immediately.
+        sic_packet_t pkt_v;
+        pkt_v = ((state == WAIT_PACKET) && packet_in.valid) ? packet_in : pkt;
+
+        op_ori = (pkt_v.info.opcode == OPC_ORI);
+        op_lui = (pkt_v.info.opcode == OPC_LUI);
+        op_lw = (pkt_v.info.opcode == OPC_LW);
+        op_sw = (pkt_v.info.opcode == OPC_SW);
+        op_beq = (pkt_v.info.opcode == OPC_BEQ);
+        op_j = (pkt_v.info.opcode == OPC_J);
+        op_jal = (pkt_v.info.opcode == OPC_JAL);
+        op_alu_r = (pkt_v.info.opcode ==  OPC_SPECIAL) &&
+                   ((pkt_v.info.funct == 6'h21) || (pkt_v.info.funct == 6'h23));
+        op_jr = (pkt_v.info.opcode == OPC_SPECIAL) && (pkt_v.info.funct == 6'h08);
+        op_syscall = (pkt_v.info.opcode == OPC_SPECIAL) && (pkt_v.info.funct == 6'h0c);
 
         // 先根据指令类型计算“资源需求”（与 state 无关）
         need_reg_read0 = (op_alu_r || op_beq || op_sw || op_ori || op_lw || op_jr);
@@ -133,12 +144,12 @@ module single_instruction_controller #(
         // - When holding a valid pkt, continuously advertise the PRs we will read/write.
         // - When not holding a pkt (IDLE/WAIT_PACKET), drive 0 so RF can see PR is not in-use.
         // 读地址：仅当该指令确实需要对应源寄存器时才声明占用，否则置 0。
-        reg_req.rs_addr = (holding_pkt && need_reg_read0) ? pkt.phy_rs : '0;
-        reg_req.rt_addr = (holding_pkt && need_reg_read1) ? pkt.phy_rt : '0;
+        reg_req.rs_addr = (holding_pkt && need_reg_read0) ? pkt_v.phy_rs : '0;
+        reg_req.rt_addr = (holding_pkt && need_reg_read1) ? pkt_v.phy_rt : '0;
 
         // 写地址：仅当该指令未来会写寄存器时才声明占用，否则置 0。
         // 注意：wcommit 仍在 COMMIT_WRITE 才会拉高；这里仅用于“占用/避免复用”的可见性。
-        reg_req.waddr = (holding_pkt && need_reg_write2) ? pkt.phy_dst : '0;
+        reg_req.waddr = (holding_pkt && need_reg_write2) ? pkt_v.phy_dst : '0;
         reg_req.wdata = reg_wdata_dst;
 
         // 外部资源：需要持有到提交或回滚，所以在整个关键区间持续请求
