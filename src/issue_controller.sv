@@ -67,15 +67,25 @@ module issue_controller #(
     // RAT only tracks logical regs 1..31. $0 is excluded and always maps to PR0.
     typedef struct {logic [PR_W-1:0] rat[31:1];} rename_state_t;
 
-    rename_state_t cur_state;
+    rename_state_t       cur_state;
 
     // 最小快照：每个 ECR 一份（只保存 RAT）
-    rename_state_t ckpt_state[NUM_ECRS];
-    logic ckpt_valid[NUM_ECRS];
+    rename_state_t       ckpt_state       [NUM_ECRS];
+    logic                ckpt_valid       [NUM_ECRS];
+    // Parent pointer for each checkpointed branch: records dependency chain before this branch.
+    // This allows correct active_ecr restoration on rollback and descendant invalidation.
+    logic          [1:0] ckpt_parent      [NUM_ECRS];
+    logic                ckpt_parent_valid[NUM_ECRS];
+    // Because issue->ECR update is registered in this design, ECR "busy" may be visible one cycle later.
+    // Track locally-reserved ECRs to prevent re-allocation / premature ckpt reclaim in that window.
+    logic                ecr_pending_busy [NUM_ECRS];
+    // Track whether we've ever observed this checkpoint's ECR in a non-free state (00 busy or 10 incorrect).
+    // Prevents reclaiming a newly-created checkpoint while the ECR monitor still reports 01 for one cycle.
+    logic                ckpt_seen_nonfree[NUM_ECRS];
 
     // branch predictor + decoder (按取指 slot 索引)
-    logic pred_taken_w[NUM_SICS];
-    instr_info_t dec_info[NUM_SICS];
+    logic                pred_taken_w     [NUM_SICS];
+    instr_info_t         dec_info         [NUM_SICS];
 
     genvar k;
     generate
@@ -147,6 +157,10 @@ module issue_controller #(
             end
             for (int e = 0; e < NUM_ECRS; e++) begin
                 ckpt_valid[e] <= 1'b0;
+                ckpt_parent[e] <= 2'b00;
+                ckpt_parent_valid[e] <= 1'b0;
+                ecr_pending_busy[e] <= 1'b0;
+                ckpt_seen_nonfree[e] <= 1'b0;
                 for (int i = 1; i < 32; i++) begin
                     ckpt_state[e].rat[i] <= PR_W'(i);
                 end
@@ -167,17 +181,31 @@ module issue_controller #(
             end
 
             // 1) 快照回收：ECR 已回到 01 且不再被任何 SIC 依赖 => 该快照失效
+            // Also update local ECR-pending bookkeeping.
             for (int e = 0; e < NUM_ECRS; e++) begin
+                // Once ECR monitor shows non-free (00/10), mark that we've seen it non-free.
+                if (ckpt_valid[e] && (ecr_monitor[e] != 2'b01)) begin
+                    ckpt_seen_nonfree[e] <= 1'b1;
+                end
+                // Clear pending once ECR becomes busy (00) or incorrect (10); it has left the free state.
+                if (ecr_pending_busy[e] && (ecr_monitor[e] != 2'b01)) begin
+                    ecr_pending_busy[e] <= 1'b0;
+                end
                 if (ckpt_valid[e] &&
                     (ecr_monitor[e] == 2'b01) &&
-                    (ecr_status.in_use[e] == 1'b0)) begin
+                    (ecr_status.in_use[e] == 1'b0) &&
+                    ckpt_seen_nonfree[e] &&          // must have been active at least once
+                    !ecr_pending_busy[e]) begin  // don't reclaim during local pending window
                     ckpt_valid[e] <= 1'b0;
+                    ckpt_parent_valid[e] <= 1'b0;
+                    ckpt_seen_nonfree[e] <= 1'b0;
                 end
             end
 
             // 2) 回滚：由 ECR file 发起（任一 ECR==10）
             if (ecr_status.rollback_valid) begin
                 int rid;
+                logic [1:0] rid_bits;
                 rid = ecr_status.rollback_id;
                 pc <= ecr_status.rollback_target_pc;
                 // 恢复检查点（若该检查点不存在，退化为不改 RAT）
@@ -186,9 +214,20 @@ module issue_controller #(
                         cur_state.rat[i] <= ckpt_state[rid].rat[i];
                     end
                 end
-                // 回滚后：清掉所有快照（最保守，最不容易错）
+                // Invalidate the rolled-back checkpoint itself and any direct descendants.
+                // (For NUM_ECRS=2, direct-child invalidation is sufficient.)
+                rid_bits = {1'b0, ecr_status.rollback_id};
+                ckpt_valid[rid] <= 1'b0;
+                ckpt_parent_valid[rid] <= 1'b0;
+                ckpt_seen_nonfree[rid] <= 1'b0;
+                ecr_pending_busy[rid] <= 1'b0;
                 for (int e = 0; e < NUM_ECRS; e++) begin
-                    ckpt_valid[e] <= 1'b0;
+                    if (ckpt_valid[e] && ckpt_parent_valid[e] && (ckpt_parent[e] == rid_bits)) begin
+                        ckpt_valid[e] <= 1'b0;
+                        ckpt_parent_valid[e] <= 1'b0;
+                        ckpt_seen_nonfree[e] <= 1'b0;
+                        ecr_pending_busy[e] <= 1'b0;
+                    end
                 end
                 jr_waiting <= 1'b0;
                 // Ack：把触发回滚的 ECR 写回 01，避免每周期重复回滚
@@ -196,8 +235,9 @@ module issue_controller #(
                 ecr_update.addr <= ecr_status.rollback_id;
                 ecr_update.do_reset <= 1'b1;
                 ecr_update.reset_data <= 2'b01;
-                // 依赖链回到“已确定”的 ECR（它已被置 01）
-                active_ecr <= {1'b0, ecr_status.rollback_id};
+                // Restore dependency chain to parent of the rolled-back branch (or 00 if unknown).
+                if (ckpt_parent_valid[rid]) active_ecr <= ckpt_parent[rid];
+                else active_ecr <= 2'b00;
             end else if (jr_waiting) begin
                 // 3) JR 等待：暂停发射直到匹配 issue_id 的重定向到来
                 logic got;
@@ -221,6 +261,7 @@ module issue_controller #(
                 logic [31:0] next_pc;
                 logic cut_packet;
                 logic stall;
+                logic branch_issued;
 
                 rename_state_t st_work;
                 logic [NUM_PHY_REGS-1:0] used_work;
@@ -230,6 +271,7 @@ module issue_controller #(
                 next_pc = pc;
                 cut_packet = 1'b0;
                 stall = 1'b0;
+                branch_issued = 1'b0;
 
                 // 工作副本：同周期 RAW 用（按发射顺序滚动更新）
                 st_work = cur_state;
@@ -330,8 +372,14 @@ module issue_controller #(
                         end
 
                         // 分支：分配 ECR + 保存快照 + 预测 PC/altPC
-                        if (!stall && is_beq) begin
-                            if (!ecr_status.alloc_avail) begin
+                        if (!stall && is_beq && branch_issued) begin
+                            // Only one branch per cycle: ecr_update/ckpt are single-ported.
+                            sic_packet_out[sic] <= '0;
+                            sic_packet_out[sic].valid <= 1'b0;
+                            stall = 1'b1;
+                        end else if (!stall && is_beq) begin
+                            // If allocator says available but this ECR is locally pending, treat as not available.
+                            if (!ecr_status.alloc_avail || ecr_pending_busy[ecr_status.alloc_id]) begin
                                 sic_packet_out[sic] <= '0;
                                 sic_packet_out[sic].valid <= 1'b0;
                                 stall = 1'b1;
@@ -341,6 +389,11 @@ module issue_controller #(
                                 // 保存快照：以“分支点之前”的状态作为回滚恢复点
                                 ckpt_state[alloc_e] <= st_work;
                                 ckpt_valid[alloc_e] <= 1'b1;
+                                ckpt_parent[alloc_e] <= active_ecr_work;
+                                ckpt_parent_valid[alloc_e] <= 1'b1;
+                                // Local reservation until monitor reflects non-free.
+                                ecr_pending_busy[alloc_e] <= 1'b1;
+                                ckpt_seen_nonfree[alloc_e] <= 1'b0;
 
                                 sic_packet_out[sic].set_ecr_id <= {1'b0, alloc_e};
 
@@ -356,6 +409,7 @@ module issue_controller #(
 
                                 // 更新依赖链：后续指令依赖新 ECR
                                 active_ecr_work = {1'b0, alloc_e};
+                                branch_issued = 1'b1;
 
                                 ip = pc + (slot << 2);
                                 br_tgt = ip + 32'd4 + (dec_info[slot].imm16_sign_ext << 2);
