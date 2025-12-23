@@ -49,6 +49,8 @@ module superscalar_machine (
     // Register File (packed) <-> SIC
     reg_req #(NUM_PHY_REGS)::t rf_req[NUM_SICS];
     reg_ans_t rf_ans[NUM_SICS];
+    logic [NUM_PHY_REGS-1:0] rf_pr_not_idle;
+    pr_state_t rf_pr_state[NUM_PHY_REGS];
 
     // SIC <-> ALU (Pool Interface)
     rpl_req #(ID_WIDTH)::t alu_rpl[NUM_SICS];
@@ -110,7 +112,9 @@ module superscalar_machine (
         .bp_update(ecr_bp_update),
         // Register File allocate pulse
         .rf_alloc_wen(rf_alloc_wen),
-        .rf_alloc_pr(rf_alloc_pr)
+        .rf_alloc_pr(rf_alloc_pr),
+        // Register File usage bitmap
+        .pr_not_idle(rf_pr_not_idle)
     );
 
     // 3. SIC 阵列
@@ -170,12 +174,14 @@ module superscalar_machine (
         .NUM_PHY_REGS(NUM_PHY_REGS),
         .NUM_SICS    (NUM_SICS)
     ) reg_file (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .alloc_wen(rf_alloc_wen),
-        .alloc_pr (rf_alloc_pr),
-        .reg_req  (rf_req),
-        .reg_ans  (rf_ans)
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .alloc_wen  (rf_alloc_wen),
+        .alloc_pr   (rf_alloc_pr),
+        .reg_req    (rf_req),
+        .reg_ans    (rf_ans),
+        .pr_not_idle(rf_pr_not_idle),
+        .pr_state   (rf_pr_state)
     );
 
     // 5. 数据内存

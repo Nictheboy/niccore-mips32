@@ -88,6 +88,10 @@ module single_instruction_controller #(
     // Reg 写回数据保持（在 CHECK_ECR 提前准备，COMMIT_WRITE 只拉高 wcommit）
     logic [31:0] reg_wdata_dst;
 
+    // Whether this SIC is currently holding a valid packet (so it should advertise PR usage).
+    logic holding_pkt;
+    assign holding_pkt = (state != IDLE) && (state != WAIT_PACKET);
+
     // 组合逻辑计算锁请求
     always_comb begin
         op_ori = (pkt.info.opcode == OPC_ORI);
@@ -125,11 +129,16 @@ module single_instruction_controller #(
         alu_rpl.req_issue_id = pkt.issue_id;
         alu_rpl.release_lock = alu_release_pulse;
 
-        // 读地址直连（不需要 req 信号；可用性用 reg_ans.*_valid 表示）
-        reg_req.rs_addr = pkt.phy_rs;
-        reg_req.rt_addr = pkt.phy_rt;
-        // 写端口：地址/数据先给出，实际写由 wcommit 决定
-        reg_req.waddr = pkt.phy_dst;
+        // Register usage advertisement:
+        // - When holding a valid pkt, continuously advertise the PRs we will read/write.
+        // - When not holding a pkt (IDLE/WAIT_PACKET), drive 0 so RF can see PR is not in-use.
+        // 读地址：仅当该指令确实需要对应源寄存器时才声明占用，否则置 0。
+        reg_req.rs_addr = (holding_pkt && need_reg_read0) ? pkt.phy_rs : '0;
+        reg_req.rt_addr = (holding_pkt && need_reg_read1) ? pkt.phy_rt : '0;
+
+        // 写地址：仅当该指令未来会写寄存器时才声明占用，否则置 0。
+        // 注意：wcommit 仍在 COMMIT_WRITE 才会拉高；这里仅用于“占用/避免复用”的可见性。
+        reg_req.waddr = (holding_pkt && need_reg_write2) ? pkt.phy_dst : '0;
         reg_req.wdata = reg_wdata_dst;
 
         // 外部资源：需要持有到提交或回滚，所以在整个关键区间持续请求

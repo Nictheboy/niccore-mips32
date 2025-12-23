@@ -32,6 +32,10 @@ module issue_controller #(
     output logic rf_alloc_wen[NUM_SICS],
     output logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr[NUM_SICS],
 
+    // === Register File usage bitmap (from register_file) ===
+    // 1 means: currently referenced by some SIC (rs/rt/waddr), so allocator must not reuse it.
+    input logic [NUM_PHY_REGS-1:0] pr_not_idle,
+
     // ECR -> Issue：汇总状态（allocator + rollback + in_use）
     input ecr_status_for_issue#(2)::t ecr_status,
     // ECR monitor：提供每个 ECR 的真实 2-bit 状态（00/01/10），用于正确管理快照生命周期
@@ -231,13 +235,14 @@ module issue_controller #(
                 st_work = cur_state;
                 active_ecr_work = active_ecr;
 
-                // used = union(cur_state + all ckpt_state(valid))
+                // used = union(cur_state + all ckpt_state(valid)) + any PR currently referenced by SICs
                 used_work = calc_used_pr(st_work);
                 for (int e = 0; e < NUM_ECRS; e++) begin
                     if (ckpt_valid[e]) begin
                         used_work |= calc_used_pr(ckpt_state[e]);
                     end
                 end
+                used_work |= pr_not_idle;
 
                 for (int sic = 0; sic < NUM_SICS; sic++) begin
                     if (sic_req_instr[sic] && !cut_packet && !stall) begin
@@ -270,15 +275,16 @@ module issue_controller #(
                         sic_packet_out[sic].phy_dst <= '0;
 
                         // 源寄存器映射
+                        // Any unused phy_* must be 0 (not X), so RF can reliably infer "in-use".
                         sic_packet_out[sic].phy_rs <= dec_info[slot].rs_valid ? map_lr(
                             st_work, dec_info[slot].rs
-                        ) : 'x;
+                        ) : '0;
                         sic_packet_out[sic].phy_rt <= dec_info[slot].rt_valid ? map_lr(
                             st_work, dec_info[slot].rt
-                        ) : 'x;
+                        ) : '0;
                         sic_packet_out[sic].phy_rd <= dec_info[slot].rd_valid ? map_lr(
                             st_work, dec_info[slot].rd
-                        ) : 'x;
+                        ) : '0;
 
                         // 指令分类（只覆盖当前 core 用到的集合）
                         is_ori = (dec_info[slot].opcode == OPC_ORI);

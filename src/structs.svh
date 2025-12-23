@@ -189,4 +189,13 @@ typedef struct packed {
     logic        rt_valid;
 } reg_ans_t;
 
+// -----------------------------
+// Physical register state (for allocation/debug)
+// -----------------------------
+typedef enum logic [1:0] {
+    PR_IDLE,        // no SIC is referencing this PR
+    PR_WAIT_VALUE,  // referenced but value not valid yet
+    PR_READING      // referenced and value valid
+} pr_state_t;
+
 `endif

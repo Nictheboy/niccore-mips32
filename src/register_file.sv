@@ -28,11 +28,18 @@ module register_file #(
 
     // === SIC interface (packed) ===
     input  reg_req#(NUM_PHY_REGS)::t reg_req[NUM_SICS],
-    output reg_ans_t                 reg_ans[NUM_SICS]
+    output reg_ans_t                 reg_ans[NUM_SICS],
+
+    // === Physical register usage/state (for allocator / debug) ===
+    output logic      [NUM_PHY_REGS-1:0] pr_not_idle,
+    output pr_state_t                    pr_state   [NUM_PHY_REGS]
 );
 
-    logic [31:0] regs[NUM_PHY_REGS];
-    logic        vld [NUM_PHY_REGS];
+    logic [            31:0] regs   [NUM_PHY_REGS];
+    logic                    vld    [NUM_PHY_REGS];
+
+    // In-use bitmap: any SIC referencing a PR via rs/rt/waddr marks it in-use.
+    logic [NUM_PHY_REGS-1:0] in_use;
 
     // 组合读：直接输出数据；由 valid 提供“是否可用”
     always_comb begin
@@ -54,6 +61,29 @@ module register_file #(
                 reg_ans[s].rt_valid = vld[reg_req[s].rt_addr];
             end
         end
+    end
+
+    // PR usage / state derivation (purely combinational; no per-PR FSM)
+    always_comb begin
+        in_use = '0;
+
+        for (int s = 0; s < NUM_SICS; s++) begin
+            if (reg_req[s].rs_addr != '0) in_use[reg_req[s].rs_addr] = 1'b1;
+            if (reg_req[s].rt_addr != '0) in_use[reg_req[s].rt_addr] = 1'b1;
+            if (reg_req[s].waddr != '0) in_use[reg_req[s].waddr] = 1'b1;
+        end
+
+        // PR0 is special ($0/unused marker): do not treat it as in-use for allocation purposes.
+        in_use[0]   = 1'b0;
+        pr_not_idle = in_use;
+
+        for (int p = 0; p < NUM_PHY_REGS; p++) begin
+            if (!in_use[p]) pr_state[p] = PR_IDLE;
+            else if (!vld[p]) pr_state[p] = PR_WAIT_VALUE;
+            else pr_state[p] = PR_READING;
+        end
+        // Force PR0 to IDLE: we use 0 as "no register referenced".
+        pr_state[0] = PR_IDLE;
     end
 
     // 生命周期控制：allocate -> valid=0；commit 写回 -> valid=1
