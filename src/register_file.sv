@@ -37,10 +37,22 @@ module register_file #(
     // 组合读：直接输出数据；由 valid 提供“是否可用”
     always_comb begin
         for (int s = 0; s < NUM_SICS; s++) begin
-            reg_ans[s].rs_rdata = regs[reg_req[s].rs_addr];
-            reg_ans[s].rt_rdata = regs[reg_req[s].rt_addr];
-            reg_ans[s].rs_valid = vld[reg_req[s].rs_addr];
-            reg_ans[s].rt_valid = vld[reg_req[s].rt_addr];
+            // PR0 behaves like MIPS $0: always reads as 0 and always valid.
+            if (reg_req[s].rs_addr == '0) begin
+                reg_ans[s].rs_rdata = 32'b0;
+                reg_ans[s].rs_valid = 1'b1;
+            end else begin
+                reg_ans[s].rs_rdata = regs[reg_req[s].rs_addr];
+                reg_ans[s].rs_valid = vld[reg_req[s].rs_addr];
+            end
+
+            if (reg_req[s].rt_addr == '0) begin
+                reg_ans[s].rt_rdata = 32'b0;
+                reg_ans[s].rt_valid = 1'b1;
+            end else begin
+                reg_ans[s].rt_rdata = regs[reg_req[s].rt_addr];
+                reg_ans[s].rt_valid = vld[reg_req[s].rt_addr];
+            end
         end
     end
 
@@ -56,8 +68,11 @@ module register_file #(
             // 1) allocate：开启新生命周期（清 valid，data 置 X 便于调试）
             for (int s = 0; s < NUM_SICS; s++) begin
                 if (alloc_wen[s]) begin
-                    vld[alloc_pr[s]]  <= 1'b0;
-                    regs[alloc_pr[s]] <= 32'hxxxx_xxxx;
+                    // Never allocate/reset PR0 ($0). It is always valid and always 0.
+                    if (alloc_pr[s] != '0) begin
+                        vld[alloc_pr[s]]  <= 1'b0;
+                        regs[alloc_pr[s]] <= 32'hxxxx_xxxx;
+                    end
                 end
             end
 
@@ -65,14 +80,20 @@ module register_file #(
             for (int s = 0; s < NUM_SICS; s++) begin
                 if (reg_req[s].wcommit) begin
 `ifndef SYNTHESIS
-                    // 禁止写物理 0..31（保留初值映射），以及禁止二次写
-                    assert (reg_req[s].waddr >= 32)
-                    else $fatal(1, "RF: illegal write to reserved pr=%0d", reg_req[s].waddr);
-                    assert (vld[reg_req[s].waddr] == 1'b0)
-                    else $fatal(1, "RF: double-write to pr=%0d", reg_req[s].waddr);
+                    // PR0: MIPS $0 semantics - writes are ignored (allowed any number of times).
+                    // PR1..31: still reserved (illegal to write).
+                    if (reg_req[s].waddr != '0) begin
+                        assert (reg_req[s].waddr >= 32)
+                        else $fatal(1, "RF: illegal write to reserved pr=%0d", reg_req[s].waddr);
+                        assert (vld[reg_req[s].waddr] == 1'b0)
+                        else $fatal(1, "RF: double-write to pr=%0d", reg_req[s].waddr);
+                    end
 `endif
-                    regs[reg_req[s].waddr] <= reg_req[s].wdata;
-                    vld[reg_req[s].waddr]  <= 1'b1;
+                    // Ignore writes to PR0; normal writeback otherwise.
+                    if (reg_req[s].waddr != '0) begin
+                        regs[reg_req[s].waddr] <= reg_req[s].wdata;
+                        vld[reg_req[s].waddr]  <= 1'b1;
+                    end
                 end
             end
         end

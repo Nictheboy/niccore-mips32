@@ -60,7 +60,8 @@ module issue_controller #(
     logic [1:0] active_ecr;
 
     // -------- 私有状态定义：逻辑寄存器映射表（RAT）--------
-    typedef struct {logic [PR_W-1:0] rat[32];} rename_state_t;
+    // RAT only tracks logical regs 1..31. $0 is excluded and always maps to PR0.
+    typedef struct {logic [PR_W-1:0] rat[31:1];} rename_state_t;
 
     rename_state_t cur_state;
 
@@ -96,6 +97,12 @@ module issue_controller #(
     assign rollback_trigger = ecr_status.rollback_valid;
 
     // 从“当前 + 所有有效快照”求一个 used bitmap（只做一次，后续本周期分配只会把 0->1）
+    // Map logical register to physical register; $0 is always PR0.
+    function automatic logic [PR_W-1:0] map_lr(input rename_state_t st, input logic [4:0] lr);
+        if (lr == 5'd0) return '0;
+        else return st.rat[lr];
+    endfunction
+
     function automatic logic [NUM_PHY_REGS-1:0] calc_used_pr(input rename_state_t st);
         logic [NUM_PHY_REGS-1:0] used;
         used = '0;
@@ -103,7 +110,8 @@ module issue_controller #(
         for (int pr = 0; pr < 32 && pr < NUM_PHY_REGS; pr++) begin
             used[pr] = 1'b1;
         end
-        for (int lr = 0; lr < 32; lr++) begin
+        // only logical regs 1..31 are tracked by RAT
+        for (int lr = 1; lr < 32; lr++) begin
             used[st.rat[lr]] = 1'b1;
         end
         return used;
@@ -129,13 +137,13 @@ module issue_controller #(
             jr_wait_issue_id <= '0;
             active_ecr <= 2'b00;
             ecr_update <= '0;
-            // 初始化 RAT：lr[i] -> pr[i]
-            for (int i = 0; i < 32; i++) begin
+            // 初始化 RAT：lr[i] -> pr[i] (exclude $0)
+            for (int i = 1; i < 32; i++) begin
                 cur_state.rat[i] <= PR_W'(i);
             end
             for (int e = 0; e < NUM_ECRS; e++) begin
                 ckpt_valid[e] <= 1'b0;
-                for (int i = 0; i < 32; i++) begin
+                for (int i = 1; i < 32; i++) begin
                     ckpt_state[e].rat[i] <= PR_W'(i);
                 end
             end
@@ -170,7 +178,7 @@ module issue_controller #(
                 pc <= ecr_status.rollback_target_pc;
                 // 恢复检查点（若该检查点不存在，退化为不改 RAT）
                 if (ckpt_valid[rid]) begin
-                    for (int i = 0; i < 32; i++) begin
+                    for (int i = 1; i < 32; i++) begin
                         cur_state.rat[i] <= ckpt_state[rid].rat[i];
                     end
                 end
@@ -257,12 +265,20 @@ module issue_controller #(
                         sic_packet_out[sic].dep_ecr_id <= active_ecr_work;
                         sic_packet_out[sic].set_ecr_id <= 'x;
                         sic_packet_out[sic].next_pc_pred <= (pc + (slot << 2)) + 32'd4;
-                        sic_packet_out[sic].phy_dst <= 'x;
+                        // Default to PR0 to avoid X-propagation. If instruction has a real dst,
+                        // it will be overwritten below; if dst is $0, it stays PR0.
+                        sic_packet_out[sic].phy_dst <= '0;
 
                         // 源寄存器映射
-                        sic_packet_out[sic].phy_rs <= dec_info[slot].rs_valid ? st_work.rat[dec_info[slot].rs] : 'x;
-                        sic_packet_out[sic].phy_rt <= dec_info[slot].rt_valid ? st_work.rat[dec_info[slot].rt] : 'x;
-                        sic_packet_out[sic].phy_rd <= dec_info[slot].rd_valid ? st_work.rat[dec_info[slot].rd] : 'x;
+                        sic_packet_out[sic].phy_rs <= dec_info[slot].rs_valid ? map_lr(
+                            st_work, dec_info[slot].rs
+                        ) : 'x;
+                        sic_packet_out[sic].phy_rt <= dec_info[slot].rt_valid ? map_lr(
+                            st_work, dec_info[slot].rt
+                        ) : 'x;
+                        sic_packet_out[sic].phy_rd <= dec_info[slot].rd_valid ? map_lr(
+                            st_work, dec_info[slot].rd
+                        ) : 'x;
 
                         // 指令分类（只覆盖当前 core 用到的集合）
                         is_ori = (dec_info[slot].opcode == OPC_ORI);
@@ -283,22 +299,27 @@ module issue_controller #(
                         else if (is_jal) dst_lr = 5'd31;
                         else if (is_ori || is_lui || is_lw) dst_lr = dec_info[slot].rt;
 
-                        if (has_dst && (dst_lr != 0)) begin
-                            pr = find_free_pr(used_work);
-                            if (pr < 0) begin
-                                // 无可用物理寄存器：本周期从该条开始不再发射
-                                sic_packet_out[sic] <= '0;
-                                sic_packet_out[sic].valid <= 1'b0;
-                                stall = 1'b1;
+                        if (has_dst) begin
+                            if (dst_lr == 5'd0) begin
+                                // Writes to $0: no allocation, no RAT update. Keep phy_dst==PR0.
+                                sic_packet_out[sic].phy_dst <= '0;
                             end else begin
-                                used_work[pr] = 1'b1; // 本周期单调增加，避免同周期复用带来混乱
-                                st_work.rat[dst_lr] = PR_W'(pr);
-                                sic_packet_out[sic].phy_dst <= PR_W'(pr);
-                                rf_alloc_wen[sic] <= 1'b1;
-                                rf_alloc_pr[sic] <= PR_W'(pr);
-                                // 为了调试一致性：覆盖对应字段的映射展示
-                                if (is_alu_r) sic_packet_out[sic].phy_rd <= PR_W'(pr);
-                                else sic_packet_out[sic].phy_rt <= PR_W'(pr);
+                                pr = find_free_pr(used_work);
+                                if (pr < 0) begin
+                                    // 无可用物理寄存器：本周期从该条开始不再发射
+                                    sic_packet_out[sic] <= '0;
+                                    sic_packet_out[sic].valid <= 1'b0;
+                                    stall = 1'b1;
+                                end else begin
+                                    used_work[pr] = 1'b1; // 本周期单调增加，避免同周期复用带来混乱
+                                    st_work.rat[dst_lr] = PR_W'(pr);
+                                    sic_packet_out[sic].phy_dst <= PR_W'(pr);
+                                    rf_alloc_wen[sic] <= 1'b1;
+                                    rf_alloc_pr[sic] <= PR_W'(pr);
+                                    // 为了调试一致性：覆盖对应字段的映射展示
+                                    if (is_alu_r) sic_packet_out[sic].phy_rd <= PR_W'(pr);
+                                    else sic_packet_out[sic].phy_rt <= PR_W'(pr);
+                                end
                             end
                         end
 
