@@ -52,6 +52,7 @@ module single_instruction_controller #(
         REQUEST_LOCKS,
         EXECUTE_READ,
         CHECK_ECR,
+        MEM_ACCESS,
         COMMIT_WRITE,
         RELEASE
     } state_t;
@@ -81,8 +82,10 @@ module single_instruction_controller #(
     // REQUEST_LOCKS 阶段的 grant 聚合（避免在 always_ff 里声明局部变量触发 Vivado 警告）
     logic all_granted;
 
-    // release_lock 需要是单周期脉冲（由时序逻辑产生），通过结构体输出给资源池锁
-    logic mem_release_pulse;
+    // release_lock:
+    // - Memory lock will be acquired only when we actually perform the mem access (lw/sw),
+    //   and released in the SAME cycle (reduce lock holding time).
+    // - Keep ALU release as a one-cycle pulse (legacy behavior).
     logic alu_release_pulse;
 
     // Reg 写回数据保持（在 CHECK_ECR 提前准备，COMMIT_WRITE 只拉高 wcommit）
@@ -135,7 +138,7 @@ module single_instruction_controller #(
         // 资源池锁结构体默认输出
         mem_rpl.req = 0;
         mem_rpl.req_issue_id = pkt.issue_id;
-        mem_rpl.release_lock = mem_release_pulse;
+        mem_rpl.release_lock = 0;
         alu_rpl.req = 0;
         alu_rpl.req_issue_id = pkt.issue_id;
         alu_rpl.release_lock = alu_release_pulse;
@@ -152,21 +155,41 @@ module single_instruction_controller #(
         reg_req.waddr = (holding_pkt && need_reg_write2) ? pkt_v.phy_dst : '0;
         reg_req.wdata = reg_wdata_dst;
 
-        // 外部资源：需要持有到提交或回滚，所以在整个关键区间持续请求
+        // 外部资源请求策略：
+        // - ALU：维持旧策略（执行期间持有直到 RELEASE），避免同周期 grant 波动引发的混乱
+        // - MEM：仅在 lw/sw 真正访存的 MEM_ACCESS 状态请求，并在 grant 当拍释放
         if (state == REQUEST_LOCKS || state == EXECUTE_READ || state == CHECK_ECR || state == COMMIT_WRITE) begin
-            mem_rpl.req = (need_mem_read || need_mem_write);
             alu_rpl.req = need_alu;
         end
+        if (state == MEM_ACCESS) begin
+            mem_rpl.req = (need_mem_read || need_mem_write);
+            // When granted, immediately release in the same cycle (no ownership retention).
+            mem_rpl.release_lock = mem_grant;
+        end
 
-        // 组装 mem_req：地址/数据来自 hold 寄存器，写使能仅在提交点拉高
+        // 组装 mem_req：地址/数据来自 hold 寄存器
         mem_req.addr  = mem_addr_hold[31:2];
         mem_req.wdata = mem_wdata_hold;
         // 注意：abort_mispredict 必须门控所有架构可见副作用，避免同一拍误提交
-        mem_req.wen   = (state == COMMIT_WRITE) && op_sw && !abort_mispredict;
+        // sw：在 MEM_ACCESS 且拿到 grant 的当拍写入（data_memory 在 negedge 生效）
+        mem_req.wen   = (state == MEM_ACCESS) && op_sw && mem_grant && !abort_mispredict;
+
+        // 写回数据源：
+        // - lw：在 MEM_ACCESS 且 grant 当拍直接用 mem_rdata 写回（减少额外拍）
+        // - 其他：使用 CHECK_ECR 里准备好的 reg_wdata_dst
+        if ((state == MEM_ACCESS) && op_lw && mem_grant) begin
+            reg_req.wdata = mem_rdata;
+        end else begin
+            reg_req.wdata = reg_wdata_dst;
+        end
 
         // 仅在提交写回状态，且确实是写寄存器类指令时，拉高 commit
-        if (state == COMMIT_WRITE) begin
-            if (op_alu_r || op_lw || op_ori || op_lui || op_jal) begin
+        // - lw：在 MEM_ACCESS（拿到 grant）当拍提交
+        // - 其他：在 COMMIT_WRITE 提交
+        if ((state == MEM_ACCESS) && op_lw && mem_grant) begin
+            reg_req.wcommit = need_reg_write2 && !abort_mispredict;
+        end else if (state == COMMIT_WRITE) begin
+            if (op_alu_r || op_ori || op_lui || op_jal) begin
                 reg_req.wcommit = need_reg_write2 && !abort_mispredict;
             end
         end
@@ -200,7 +223,6 @@ module single_instruction_controller #(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
-            mem_release_pulse <= 0;
             alu_release_pulse <= 0;
             ecr_wen <= 0;
             reg_wdata_dst <= 32'b0;
@@ -212,7 +234,6 @@ module single_instruction_controller #(
             pc_redirect_issue_id <= '0;
         end else begin
             // 默认清除 Release 信号 (Release 仅维持一个周期)
-            mem_release_pulse <= 0;
             alu_release_pulse <= 0;
             ecr_wen           <= 0;
             pc_redirect_valid <= 0;
@@ -316,12 +337,26 @@ module single_instruction_controller #(
                                 // 约定：无延迟槽，link = PC+4
                                 reg_wdata_dst <= pkt.pc + 32'd4;
                             end
-                            if (op_lw) begin
-                                reg_wdata_dst <= mem_rdata;
+                            // lw/sw：不要在这里读内存（此时不应持有 mem 锁）
+                            // 改为进入 MEM_ACCESS，在拿到 grant 当拍完成读/写并立即释放锁
+                            if (op_lw || op_sw) begin
+                                state <= MEM_ACCESS;
+                            end else begin
+                                state <= COMMIT_WRITE;
                             end
-                            state <= COMMIT_WRITE;
                         end
                         // 若为 00 (Busy)，保持此状态等待
+                    end
+
+                    MEM_ACCESS: begin
+                        // lw/sw：等待内存 grant；拿到 grant 当拍完成访存并立即释放锁
+                        // - lw: 组合读 mem_rdata，在该拍 posedge 提交写回
+                        // - sw: 该拍 negedge 完成写入
+                        if (mem_grant) begin
+                            state <= RELEASE;
+                        end else begin
+                            state <= MEM_ACCESS;
+                        end
                     end
 
                     COMMIT_WRITE: begin
@@ -368,7 +403,6 @@ module single_instruction_controller #(
                         // 发出释放信号
                         // 注意：这里不能依赖 reg_req_*/mem_req_*/alu_req，
                         // 因为这些 req 信号在 RELEASE 状态会被组合逻辑门控为 0。
-                        if (need_mem_read || need_mem_write) mem_release_pulse <= 1;
                         if (need_alu) alu_release_pulse <= 1;
                         // ECR 不再需要释放信号
 
