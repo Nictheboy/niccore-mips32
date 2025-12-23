@@ -105,6 +105,7 @@ module superscalar_machine (
         .sic_pc_redirect_issue_id(sic_pc_redirect_issue_id),
         .rollback_trigger(rollback_sig),
         .ecr_status(ecr_status),
+        .ecr_monitor(ecr_monitor),
         .ecr_update(issue_ecr_update),
         .bp_update(ecr_bp_update),
         // Register File allocate pulse

@@ -1,6 +1,10 @@
 
 `include "structs.svh"
 
+// NOTE:
+// - 该文件将被重写为“RAT 状态 + 最小快照 + 通过所有投机状态求 free PR”的版本。
+// - 按用户要求：先删掉旧实现的大部分代码，再分段插入新实现。
+
 module issue_controller #(
     parameter int NUM_SICS,
     parameter int NUM_PHY_REGS,
@@ -17,7 +21,6 @@ module issue_controller #(
     // SIC 交互接口
     input  logic                       sic_req_instr           [NUM_SICS],
     output sic_packet_t                sic_packet_out          [NUM_SICS],
-    // SIC -> Issue：JR 提交后的 PC 重定向（当发射到 jr 后，Issue 会等待该重定向再继续发射）
     input  logic                       sic_pc_redirect_valid   [NUM_SICS],
     input  logic        [        31:0] sic_pc_redirect_pc      [NUM_SICS],
     input  logic        [ID_WIDTH-1:0] sic_pc_redirect_issue_id[NUM_SICS],
@@ -31,6 +34,8 @@ module issue_controller #(
 
     // ECR -> Issue：汇总状态（allocator + rollback + in_use）
     input ecr_status_for_issue#(2)::t ecr_status,
+    // ECR monitor：提供每个 ECR 的真实 2-bit 状态（00/01/10），用于正确管理快照生命周期
+    input logic [1:0] ecr_monitor[2],
 
     // Issue -> ECR：统一更新（reset + bpinfo + altpc）
     output ecr_reset_for_issue#(2)::t ecr_update,
@@ -39,48 +44,34 @@ module issue_controller #(
     input bp_update_t bp_update
 );
 
-    // PC 管理
-    logic [31:0] pc, next_pc;
+    localparam int NUM_ECRS = 2;
+    localparam int ECR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
+    localparam int PR_W = (NUM_PHY_REGS > 1) ? $clog2(NUM_PHY_REGS) : 1;
+
+    // PC / Issue ID
+    logic [31:0] pc;
     logic [ID_WIDTH-1:0] global_issue_id;
 
-    // JR 等待模式：一旦发射到 jr，停止继续发射，直到收到匹配 issue_id 的重定向
+    // JR 等待：发射到 JR 后暂停，直到收到匹配 issue_id 的 redirect
     logic jr_waiting;
     logic [ID_WIDTH-1:0] jr_wait_issue_id;
 
-    // 寄存器别名表 (RAT) & 空闲列表 (Free List)
-    // 简单实现：Logical Reg [0..31] -> Physical Reg [0..NUM_PHY_REGS-1]
-    logic [$clog2(NUM_PHY_REGS)-1:0] rat[32];
-    // 最简单可理解的回收：free_bitmap + “全空闲时回收（quiescent reclaim）”
-    // - free_bitmap[pr]=1 表示该物理寄存器可分配
-    // - 只在所有 SIC 都空闲时，把 pending_free 里的旧版本物理寄存器放回 free_bitmap
-    logic [NUM_PHY_REGS-1:0] free_bitmap;
-    logic [$clog2(NUM_PHY_REGS)-1:0] pending_free[NUM_PHY_REGS];
-    int unsigned pending_free_cnt;
+    // 当前“依赖链”的 ECR（把它塞进 packet.dep_ecr_id）
+    logic [1:0] active_ecr;
 
-    // Vivado 兼容：不要在 always_ff 中声明 unpacked array 的局部变量
-    // 这些“work shadow”仅用于同一个周期内多次分配时的临时计算
-    logic [NUM_PHY_REGS-1:0] free_bitmap_work;
-    logic [$clog2(NUM_PHY_REGS)-1:0] pending_free_work[NUM_PHY_REGS];
-    int unsigned pending_free_cnt_work;
-    logic all_sics_quiet;
+    // -------- 私有状态定义：逻辑寄存器映射表（RAT）--------
+    typedef struct {logic [PR_W-1:0] rat[32];} rename_state_t;
 
-    // 分支检查点（每个 ECR 一份）：用于预测失败时恢复重命名状态，保证正确性
-    logic [$clog2(NUM_PHY_REGS)-1:0] rat_ckpt[2][32];
-    logic [NUM_PHY_REGS-1:0] free_bitmap_ckpt[2];
-    logic [$clog2(NUM_PHY_REGS)-1:0] pending_free_ckpt[2][NUM_PHY_REGS];
-    int unsigned pending_free_cnt_ckpt[2];
+    rename_state_t cur_state;
 
-    // ECR 管理
-    logic [1:0] active_ecr;  // 当前依赖的 ECR (Latest Branch)
+    // 最小快照：每个 ECR 一份（只保存 RAT）
+    rename_state_t ckpt_state[NUM_ECRS];
+    logic ckpt_valid[NUM_ECRS];
 
-    // 分支预测实例接口
-    // 注意：这些数组的索引是“取指槽位 slot”，不是 SIC 编号。
+    // branch predictor + decoder (按取指 slot 索引)
     logic pred_taken_w[NUM_SICS];
-
-    // 内部解码连线（索引同样是取指槽位 slot）
     instr_info_t dec_info[NUM_SICS];
 
-    // 实例化解码器组
     genvar k;
     generate
         for (k = 0; k < NUM_SICS; k++) begin : decoders
@@ -88,8 +79,6 @@ module issue_controller #(
                 .instr(imem_data[k]),
                 .info (dec_info[k])
             );
-
-            // 分支预测查询
             branch_predictor #(
                 .TABLE_SIZE(BRANCH_PREDICTOR_TABLE_SIZE)
             ) bp (
@@ -97,276 +86,185 @@ module issue_controller #(
                 .rst_n(rst_n),
                 .query_pc(pc + (k << 2)),
                 .pred_taken(pred_taken_w[k]),
-                // 更新由 ECR 做，issue_controller 仅转接
                 .bp_update(bp_update)
             );
         end
     endgenerate
 
-    // 回滚控制
-    logic trigger_rollback;
-    logic [31:0] rollback_target_pc;
-    logic rollback_ecr_valid;
-    logic [0:0] rollback_ecr_idx;
-
-    // 回滚信息由 ECR 提供（ecr_status.rollback_*）
-
+    // 基本连线
     assign imem_addr = pc;
-    assign rollback_trigger = trigger_rollback;
-    // ecr_reset_data 由时序逻辑驱动：
-    // - 分配新分支时写 00(Busy)
-    // - 发生回滚时对触发回滚的 ECR 写 01(已确定) 以“ack”该次回滚，避免每周期重复回滚
+    assign rollback_trigger = ecr_status.rollback_valid;
 
-    always_comb begin
-        trigger_rollback   = ecr_status.rollback_valid;
-        rollback_target_pc = ecr_status.rollback_target_pc;
-        rollback_ecr_valid = ecr_status.rollback_valid;
-        rollback_ecr_idx   = ecr_status.rollback_id;
-    end
+    // 从“当前 + 所有有效快照”求一个 used bitmap（只做一次，后续本周期分配只会把 0->1）
+    function automatic logic [NUM_PHY_REGS-1:0] calc_used_pr(input rename_state_t st);
+        logic [NUM_PHY_REGS-1:0] used;
+        used = '0;
+        // 0..31 永久保留（架构初值映射）
+        for (int pr = 0; pr < 32 && pr < NUM_PHY_REGS; pr++) begin
+            used[pr] = 1'b1;
+        end
+        for (int lr = 0; lr < 32; lr++) begin
+            used[st.rat[lr]] = 1'b1;
+        end
+        return used;
+    endfunction
 
-    // 主逻辑
+    function automatic int find_free_pr(input logic [NUM_PHY_REGS-1:0] used);
+        int found;
+        found = -1;
+        for (int pr = 32; pr < NUM_PHY_REGS; pr++) begin
+            if (!used[pr]) begin
+                found = pr;
+                break;
+            end
+        end
+        return found;
+    endfunction
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pc <= 32'h0000_3000;
-            global_issue_id <= 0;
-            active_ecr <= 0;
-            // 初始化 RAT：逻辑寄存器 0..31 映射到物理 0..31
-            // 初始化 free_bitmap：物理 32..NUM_PHY_REGS-1 可分配
-            free_bitmap <= '0;
-            for (int pr = 32; pr < NUM_PHY_REGS; pr++) begin
-                free_bitmap[pr] <= 1'b1;
-            end
-            pending_free_cnt <= 0;
-            ecr_update <= '0;
-            jr_waiting <= 0;
+            global_issue_id <= '0;
+            jr_waiting <= 1'b0;
             jr_wait_issue_id <= '0;
-            for (int i = 0; i < 32; i++) rat[i] <= i;
-            for (int s = 0; s < NUM_SICS; s++) begin
-                rf_alloc_wen[s] <= 0;
-                rf_alloc_pr[s]  <= '0;
-            end
-            // 检查点初始化为当前状态
-            for (int e = 0; e < 2; e++) begin
-                for (int i = 0; i < 32; i++) rat_ckpt[e][i] <= i[$clog2(NUM_PHY_REGS)-1:0];
-                free_bitmap_ckpt[e] <= free_bitmap;
-                pending_free_cnt_ckpt[e] <= 0;
-            end
-            // 复位时所有输出包清零或置无效
-            for (int i = 0; i < NUM_SICS; i++) begin
-                sic_packet_out[i] <= '0; // 复位可以用 0，也可以用 x，这里用 0 比较干净
-            end
-        end else if (trigger_rollback) begin
-            pc <= rollback_target_pc;
-            // 预测失败：恢复该 ECR 对应的检查点（RAT/空闲表/待回收队列），保证正确性
-            for (int i = 0; i < 32; i++) begin
-                rat[i] <= rat_ckpt[rollback_ecr_idx][i];
-            end
-            free_bitmap <= free_bitmap_ckpt[rollback_ecr_idx];
-            for (int k = 0; k < NUM_PHY_REGS; k++) begin
-                pending_free[k] <= pending_free_ckpt[rollback_ecr_idx][k];
-            end
-            pending_free_cnt <= pending_free_cnt_ckpt[rollback_ecr_idx];
-
-            // 回滚后让后续指令依赖于“刚被确定”的 ECR（我们会把它 ack 成 01）
-            active_ecr <= rollback_ecr_idx;
-            jr_waiting <= 0;
-            // Ack：清除触发回滚的 ECR 的 10 状态，避免重复回滚
+            active_ecr <= 2'b00;
             ecr_update <= '0;
-            if (rollback_ecr_valid) begin
-                ecr_update.wen        <= 1'b1;
-                ecr_update.addr       <= rollback_ecr_idx;
-                ecr_update.do_reset   <= 1'b1;
-                ecr_update.reset_data <= 2'b01;
+            // 初始化 RAT：lr[i] -> pr[i]
+            for (int i = 0; i < 32; i++) begin
+                cur_state.rat[i] <= PR_W'(i);
             end
-            // 回滚时，当前周期的输出应设为无效
-            for (int i = 0; i < NUM_SICS; i++) begin
-                sic_packet_out[i] <= 'x;
-                sic_packet_out[i].valid <= 0;
+            for (int e = 0; e < NUM_ECRS; e++) begin
+                ckpt_valid[e] <= 1'b0;
+                for (int i = 0; i < 32; i++) begin
+                    ckpt_state[e].rat[i] <= PR_W'(i);
+                end
             end
             for (int s = 0; s < NUM_SICS; s++) begin
-                rf_alloc_wen[s] <= 0;
-                rf_alloc_pr[s]  <= '0;
+                sic_packet_out[s] <= '0;
+                rf_alloc_wen[s]   <= 1'b0;
+                rf_alloc_pr[s]    <= '0;
             end
         end else begin
-            // 默认不更新 ECR
+            // 默认：不更新 ECR / 不分配 RF 生命周期 / 不发射
             ecr_update <= '0;
-            // =========================================================
-            // 0. JR 等待模式：不发射，直到收到匹配 issue_id 的 PC 重定向
-            // =========================================================
-            if (jr_waiting) begin
-                logic got_redirect;
-                logic [31:0] redirect_pc;
-                got_redirect = 0;
-                redirect_pc  = 32'b0;
+            for (int s = 0; s < NUM_SICS; s++) begin
+                sic_packet_out[s] <= '0;
+                sic_packet_out[s].valid <= 1'b0;
+                rf_alloc_wen[s]   <= 1'b0;
+                rf_alloc_pr[s]    <= '0;
+            end
 
-                for (int i = 0; i < NUM_SICS; i++) begin
-                    if (sic_pc_redirect_valid[i] && (sic_pc_redirect_issue_id[i] == jr_wait_issue_id)) begin
-                        got_redirect = 1;
-                        redirect_pc  = sic_pc_redirect_pc[i];
+            // 1) 快照回收：ECR 已回到 01 且不再被任何 SIC 依赖 => 该快照失效
+            for (int e = 0; e < NUM_ECRS; e++) begin
+                if (ckpt_valid[e] &&
+                    (ecr_monitor[e] == 2'b01) &&
+                    (ecr_status.in_use[e] == 1'b0)) begin
+                    ckpt_valid[e] <= 1'b0;
+                end
+            end
+
+            // 2) 回滚：由 ECR file 发起（任一 ECR==10）
+            if (ecr_status.rollback_valid) begin
+                int rid;
+                rid = ecr_status.rollback_id;
+                pc <= ecr_status.rollback_target_pc;
+                // 恢复检查点（若该检查点不存在，退化为不改 RAT）
+                if (ckpt_valid[rid]) begin
+                    for (int i = 0; i < 32; i++) begin
+                        cur_state.rat[i] <= ckpt_state[rid].rat[i];
                     end
                 end
-
-                // 默认：不发射任何指令
+                // 回滚后：清掉所有快照（最保守，最不容易错）
+                for (int e = 0; e < NUM_ECRS; e++) begin
+                    ckpt_valid[e] <= 1'b0;
+                end
+                jr_waiting <= 1'b0;
+                // Ack：把触发回滚的 ECR 写回 01，避免每周期重复回滚
+                ecr_update.wen <= 1'b1;
+                ecr_update.addr <= ecr_status.rollback_id;
+                ecr_update.do_reset <= 1'b1;
+                ecr_update.reset_data <= 2'b01;
+                // 依赖链回到“已确定”的 ECR（它已被置 01）
+                active_ecr <= {1'b0, ecr_status.rollback_id};
+            end else if (jr_waiting) begin
+                // 3) JR 等待：暂停发射直到匹配 issue_id 的重定向到来
+                logic got;
+                logic [31:0] rpc;
+                got = 1'b0;
+                rpc = 32'b0;
                 for (int i = 0; i < NUM_SICS; i++) begin
-                    sic_packet_out[i] <= 'x;
-                    sic_packet_out[i].valid <= 0;
+                    if (sic_pc_redirect_valid[i] &&
+                        (sic_pc_redirect_issue_id[i] == jr_wait_issue_id)) begin
+                        got = 1'b1;
+                        rpc = sic_pc_redirect_pc[i];
+                    end
                 end
-                for (int s = 0; s < NUM_SICS; s++) begin
-                    rf_alloc_wen[s] <= 0;
-                    rf_alloc_pr[s]  <= '0;
-                end
-
-                // 默认不写 ECR
-                // ecr_update 在外层已默认清零
-
-                if (got_redirect) begin
-                    pc <= redirect_pc;
-                    jr_waiting <= 0;
+                if (got) begin
+                    pc <= rpc;
+                    jr_waiting <= 1'b0;
                 end
             end else begin
-                // 变量声明
-                int instructions_issued_this_cycle;
-                logic [31:0] next_cycle_pc;
-                logic branch_taken_in_packet;
-                logic issue_stall;
-                logic jr_issued_this_cycle;
+                // 4) 主发射逻辑（最简）：按 slot 顺序把取指槽位映射到“请求的 SIC”
+                int issued;
+                logic [31:0] next_pc;
+                logic cut_packet;
+                logic stall;
 
-                // Vivado 兼容：过程块内声明集中放在该 begin/end 的最前面（循环里只复用这些变量）
-                logic has_dest;
-                logic [4:0] dest_lr;
-                logic [$clog2(NUM_PHY_REGS)-1:0] dest_pr;
+                rename_state_t st_work;
+                logic [NUM_PHY_REGS-1:0] used_work;
+                logic [1:0] active_ecr_work;
 
-                // 局部变量统计物理寄存器消耗量，用于最后一次性更新 FreeHead
-                int regs_consumed;
+                issued = 0;
+                next_pc = pc;
+                cut_packet = 1'b0;
+                stall = 1'b0;
 
-                // 引入当前依赖 ECR 变量
-                logic [1:0] current_active_ecr;
-                // 为了支持“同周期内 RAW”，使用一个工作 RAT（按发射顺序滚动更新）
-                logic [$clog2(NUM_PHY_REGS)-1:0] rat_work[32];
+                // 工作副本：同周期 RAW 用（按发射顺序滚动更新）
+                st_work = cur_state;
+                active_ecr_work = active_ecr;
 
-                instructions_issued_this_cycle = 0;
-                regs_consumed = 0;
-                next_cycle_pc = pc + 4;  // 默认下一周期 PC
-                branch_taken_in_packet = 0;
-                issue_stall = 0;
-                jr_issued_this_cycle = 0;
-                // 默认不写 ECR
-                // ecr_update 在外层已默认清零
-
-                // 工作副本：本周期内滚动修改，最后一次性提交
-                free_bitmap_work = free_bitmap;
-                pending_free_cnt_work = pending_free_cnt;
-                for (int k = 0; k < NUM_PHY_REGS; k++) begin
-                    pending_free_work[k] = pending_free[k];
-                end
-
-                // 默认：本周期不 allocate 新生命周期（仅当成功分配目的物理寄存器时才拉高对应端口）
-                for (int s = 0; s < NUM_SICS; s++) begin
-                    rf_alloc_wen[s] = 0;
-                    rf_alloc_pr[s]  = '0;
-                end
-
-                // Quiescent reclaim：当所有 SIC 都空闲时，把旧版本物理寄存器放回 free_bitmap
-                all_sics_quiet = 1;
-                for (int s = 0; s < NUM_SICS; s++) begin
-                    if (!sic_req_instr[s]) all_sics_quiet = 0;
-                end
-                if (all_sics_quiet && (pending_free_cnt_work > 0)) begin
-                    // 综合友好：循环上界必须是常量，不能用 pending_free_cnt_work
-                    for (int k = 0; k < NUM_PHY_REGS; k++) begin
-                        if (k < pending_free_cnt_work) begin
-                            free_bitmap_work[pending_free_work[k]] = 1'b1;
-                        end
+                // used = union(cur_state + all ckpt_state(valid))
+                used_work = calc_used_pr(st_work);
+                for (int e = 0; e < NUM_ECRS; e++) begin
+                    if (ckpt_valid[e]) begin
+                        used_work |= calc_used_pr(ckpt_state[e]);
                     end
-                    pending_free_cnt_work = 0;
                 end
 
-                // 初始化为寄存器值
-                current_active_ecr = active_ecr;
-                for (int r = 0; r < 32; r++) begin
-                    rat_work[r] = rat[r];
-                end
-
-                for (int i = 0; i < NUM_SICS; i++) begin
-                    // 默认值（每轮复位，避免未赋值告警）
-                    has_dest = 0;
-                    dest_lr  = 5'd0;
-                    dest_pr  = '0;
-
-                    // 判断是否发射：请求指令 + 无跳转 + 无 Stall
-                    if (sic_req_instr[i] && !branch_taken_in_packet && !issue_stall) begin : issue_block
-                        // Vivado 兼容：该 begin/end 内的声明必须在最前面
+                for (int sic = 0; sic < NUM_SICS; sic++) begin
+                    if (sic_req_instr[sic] && !cut_packet && !stall) begin
+                        // Vivado 兼容：过程块内变量声明必须出现在 begin 的最前面
                         int slot;
-                        int alloc_pr;
-                        logic [$clog2(NUM_PHY_REGS)-1:0] old_pr;
-                        logic
-                            is_alu_r,
-                            is_ori,
-                            is_lui,
-                            is_lw,
-                            is_sw,
-                            is_beq,
-                            is_j,
-                            is_jal,
-                            is_jr,
-                            is_syscall;
+                        int pr;
+                        logic is_alu_r, is_ori, is_lui, is_lw, is_sw, is_beq, is_j, is_jal, is_jr;
+                        logic has_dst;
+                        logic [4:0] dst_lr;
+                        logic [ECR_W-1:0] alloc_e;
+                        logic [31:0] ip;
+                        logic [31:0] br_tgt;
+                        logic [31:0] fall;
+                        logic [31:0] j_tgt;
 
-                        // 关键：为“请求指令的 SIC”分配一个连续的取指槽位 slot，
-                        // 解码/预测/PC 都以 slot 为准，而不是以 SIC 编号 i 为准。
-                        slot = instructions_issued_this_cycle;
-                        alloc_pr = -1;
-                        old_pr = '0;
-                        is_alu_r = 0;
-                        is_ori = 0;
-                        is_lui = 0;
-                        is_lw = 0;
-                        is_sw = 0;
-                        is_beq = 0;
-                        is_j = 0;
-                        is_jal = 0;
-                        is_jr = 0;
-                        is_syscall = 0;
+                        slot = issued;
 
-                        // === 1. 发射逻辑 ===
-                        sic_packet_out[i].valid <= 1;
+                        // 默认发射
+                        sic_packet_out[sic] <= '0;
+                        sic_packet_out[sic].valid <= 1'b1;
+                        sic_packet_out[sic].pc <= pc + (slot << 2);
+                        sic_packet_out[sic].issue_id <= global_issue_id + ID_WIDTH'(slot);
+                        sic_packet_out[sic].info <= dec_info[slot];
+                        sic_packet_out[sic].pred_taken <= pred_taken_w[slot];
+                        sic_packet_out[sic].dep_ecr_id <= active_ecr_work;
+                        sic_packet_out[sic].set_ecr_id <= 'x;
+                        sic_packet_out[sic].next_pc_pred <= (pc + (slot << 2)) + 32'd4;
+                        sic_packet_out[sic].phy_dst <= 'x;
 
-                        // PC
-                        sic_packet_out[i].pc <= pc + (slot << 2);
+                        // 源寄存器映射
+                        sic_packet_out[sic].phy_rs <= dec_info[slot].rs_valid ? st_work.rat[dec_info[slot].rs] : 'x;
+                        sic_packet_out[sic].phy_rt <= dec_info[slot].rt_valid ? st_work.rat[dec_info[slot].rt] : 'x;
+                        sic_packet_out[sic].phy_rd <= dec_info[slot].rd_valid ? st_work.rat[dec_info[slot].rd] : 'x;
 
-                        // Issue ID (基准 + 偏移)
-                        sic_packet_out[i].issue_id <= global_issue_id + ID_WIDTH'(slot);
-
-                        // 解码信息透传
-                        sic_packet_out[i].info <= dec_info[slot];
-                        // is_branch 已迁移到 info 内，由 instruction_decoder 产生
-                        sic_packet_out[i].pred_taken <= pred_taken_w[slot];
-                        sic_packet_out[i].dep_ecr_id <= current_active_ecr;
-
-                        // =========================================================
-                        // 寄存器字段映射（按 decoder 的 rs/rt/rd_valid 决定是否有意义）
-                        // 约定：若字段无意义，则对应物理号置为 'x 便于调试
-                        // =========================================================
-                        if (dec_info[slot].rs_valid)
-                            sic_packet_out[i].phy_rs <= rat_work[dec_info[slot].rs];
-                        else sic_packet_out[i].phy_rs <= 'x;
-
-                        if (dec_info[slot].rt_valid)
-                            sic_packet_out[i].phy_rt <= rat_work[dec_info[slot].rt];
-                        else sic_packet_out[i].phy_rt <= 'x;
-
-                        if (dec_info[slot].rd_valid)
-                            sic_packet_out[i].phy_rd <= rat_work[dec_info[slot].rd];
-                        else sic_packet_out[i].phy_rd <= 'x;
-
-                        // 默认无目的寄存器
-                        sic_packet_out[i].phy_dst <= 'x;
-
-                        // =========================================================
-                        // 寄存器重命名（真正写回目的寄存器 -> phy_dst）
-                        // 规则：在同一个“无分支隔断”的发射窗口内，每次写同一逻辑寄存器都会分配新的物理寄存器，
-                        // 且后续指令读取应看到最新映射（使用 rat_work 滚动更新）。
-                        // =========================================================
-                        // 指令分类（由 info.opcode + funct 推导）
+                        // 指令分类（只覆盖当前 core 用到的集合）
                         is_ori = (dec_info[slot].opcode == OPC_ORI);
                         is_lui = (dec_info[slot].opcode == OPC_LUI);
                         is_lw = (dec_info[slot].opcode == OPC_LW);
@@ -374,96 +272,54 @@ module issue_controller #(
                         is_beq = (dec_info[slot].opcode == OPC_BEQ);
                         is_j = (dec_info[slot].opcode == OPC_J);
                         is_jal = (dec_info[slot].opcode == OPC_JAL);
-                        is_alu_r   = (dec_info[slot].opcode == OPC_SPECIAL) &&
-                                 ((dec_info[slot].funct == 6'h21) || (dec_info[slot].funct == 6'h23));
-                        is_jr      = (dec_info[slot].opcode == OPC_SPECIAL) && (dec_info[slot].funct == 6'h08);
-                        is_syscall = (dec_info[slot].opcode == OPC_SPECIAL) && (dec_info[slot].funct == 6'h0c);
+                        is_alu_r = (dec_info[slot].opcode == OPC_SPECIAL) &&
+                                   ((dec_info[slot].funct == 6'h21) || (dec_info[slot].funct == 6'h23));
+                        is_jr = (dec_info[slot].opcode == OPC_SPECIAL) && (dec_info[slot].funct == 6'h08);
 
-                        has_dest = (is_alu_r || is_ori || is_lui || is_lw || is_jal);
-                        dest_lr = 5'd0;
+                        // 目的寄存器重命名
+                        has_dst = is_alu_r || is_ori || is_lui || is_lw || is_jal;
+                        dst_lr = 5'd0;
+                        if (is_alu_r) dst_lr = dec_info[slot].rd;
+                        else if (is_jal) dst_lr = 5'd31;
+                        else if (is_ori || is_lui || is_lw) dst_lr = dec_info[slot].rt;
 
-                        if (is_alu_r) begin
-                            dest_lr = dec_info[slot].rd;
-                        end else if (is_jal) begin
-                            dest_lr = 5'd31;
-                        end else if (is_ori || is_lui || is_lw) begin
-                            dest_lr = dec_info[slot].rt;
-                        end
-
-                        if (has_dest && (dest_lr != 0)) begin
-                            // 只从 32..NUM_PHY_REGS-1 里分配（0..31 保留给架构初始映射）
-                            for (int pr = 32; pr < NUM_PHY_REGS; pr++) begin
-                                if (free_bitmap_work[pr]) begin
-                                    alloc_pr = pr;
-                                    break;
-                                end
-                            end
-
-                            if (alloc_pr == -1) begin
-                                // 没有可用物理寄存器：本周期停止发射
-                                sic_packet_out[i] <= 'x;
-                                sic_packet_out[i].valid <= 0;
-                                issue_stall = 1;
+                        if (has_dst && (dst_lr != 0)) begin
+                            pr = find_free_pr(used_work);
+                            if (pr < 0) begin
+                                // 无可用物理寄存器：本周期从该条开始不再发射
+                                sic_packet_out[sic] <= '0;
+                                sic_packet_out[sic].valid <= 1'b0;
+                                stall = 1'b1;
                             end else begin
-                                // 记录旧版本物理寄存器，等全空闲时再回收（最简单且安全）
-                                old_pr = rat_work[dest_lr];
-                                if (old_pr >= 32) begin
-                                    pending_free_work[pending_free_cnt_work] = old_pr;
-                                    pending_free_cnt_work++;
-                                end
-
-                                // 分配新物理寄存器
-                                free_bitmap_work[alloc_pr] = 1'b0;
-                                dest_pr = alloc_pr[$clog2(NUM_PHY_REGS)-1:0];
-                                sic_packet_out[i].phy_dst <= dest_pr;
-                                // 发出“开启新生命周期”脉冲给寄存器文件
-                                rf_alloc_wen[i] = 1;
-                                rf_alloc_pr[i]  = dest_pr;
-
-                                // 同时把对应逻辑字段的物理映射更新为新值（便于调试观测）
-                                if (is_alu_r) sic_packet_out[i].phy_rd <= dest_pr;
-                                else if (is_ori || is_lui || is_lw)
-                                    sic_packet_out[i].phy_rt <= dest_pr;
-
-                                // 更新工作 RAT，供后续同周期指令读取
-                                rat_work[dest_lr] = dest_pr;
-                                regs_consumed++;
+                                used_work[pr] = 1'b1; // 本周期单调增加，避免同周期复用带来混乱
+                                st_work.rat[dst_lr] = PR_W'(pr);
+                                sic_packet_out[sic].phy_dst <= PR_W'(pr);
+                                rf_alloc_wen[sic] <= 1'b1;
+                                rf_alloc_pr[sic] <= PR_W'(pr);
+                                // 为了调试一致性：覆盖对应字段的映射展示
+                                if (is_alu_r) sic_packet_out[sic].phy_rd <= PR_W'(pr);
+                                else sic_packet_out[sic].phy_rt <= PR_W'(pr);
                             end
                         end
 
-                        // 分支/跳转与 ECR
-                        if (is_beq) begin
-                            logic [31:0] current_instr_pc;
-                            logic [31:0] branch_target;
-                            logic [31:0] fall_through;
-                            logic [ 0:0] alloc_ecr;
-
-                            alloc_ecr = ecr_status.alloc_id;
-
-                            // 由 ECR 内部仲裁：只要 alloc_avail=0 就必须 Stall
+                        // 分支：分配 ECR + 保存快照 + 预测 PC/altPC
+                        if (!stall && is_beq) begin
                             if (!ecr_status.alloc_avail) begin
-                                // 资源冲突，停止发射当前指令及后续指令
-                                sic_packet_out[i] <= 'x;
-                                sic_packet_out[i].valid <= 0;
-                                issue_stall = 1;
+                                sic_packet_out[sic] <= '0;
+                                sic_packet_out[sic].valid <= 1'b0;
+                                stall = 1'b1;
                             end else begin
-                                // ECR 可用，分配给当前分支
-                                sic_packet_out[i].set_ecr_id <= alloc_ecr;
+                                alloc_e = ecr_status.alloc_id;
 
-                                // 关键：保存检查点（用于该分支预测失败时恢复 RAT/free_bitmap/pending_free）
-                                for (int r = 0; r < 32; r++) begin
-                                    rat_ckpt[alloc_ecr][r] <= rat_work[r];
-                                end
-                                free_bitmap_ckpt[alloc_ecr] <= free_bitmap_work;
-                                for (int k = 0; k < NUM_PHY_REGS; k++) begin
-                                    pending_free_ckpt[alloc_ecr][k] <= pending_free_work[k];
-                                end
-                                pending_free_cnt_ckpt[alloc_ecr] <= pending_free_cnt_work;
+                                // 保存快照：以“分支点之前”的状态作为回滚恢复点
+                                ckpt_state[alloc_e] <= st_work;
+                                ckpt_valid[alloc_e] <= 1'b1;
 
-                                // 立即将该 ECR 置为 Busy (00) + 写入分支元信息 + 写入 alt_pc
-                                ecr_update <= '0;
+                                sic_packet_out[sic].set_ecr_id <= {1'b0, alloc_e};
+
+                                // 置 ECR busy + 写分支元信息 + 写 altpc
                                 ecr_update.wen <= 1'b1;
-                                ecr_update.addr <= alloc_ecr[$bits(ecr_update.addr)-1:0];
+                                ecr_update.addr <= alloc_e;
                                 ecr_update.do_reset <= 1'b1;
                                 ecr_update.reset_data <= 2'b00;
                                 ecr_update.do_bpinfo <= 1'b1;
@@ -471,102 +327,54 @@ module issue_controller #(
                                 ecr_update.bpinfo_pred_taken <= pred_taken_w[slot];
                                 ecr_update.do_altpc <= 1'b1;
 
-                                // 更新循环变量，使得下一条指令依赖于这个新 ECR
-                                current_active_ecr = alloc_ecr;
+                                // 更新依赖链：后续指令依赖新 ECR
+                                active_ecr_work = {1'b0, alloc_e};
 
-                                current_instr_pc = pc + (slot << 2);
-                                branch_target = current_instr_pc + 4 + (dec_info[slot].imm16_sign_ext << 2);
-                                fall_through = current_instr_pc + 4;
+                                ip = pc + (slot << 2);
+                                br_tgt = ip + 32'd4 + (dec_info[slot].imm16_sign_ext << 2);
+                                fall = ip + 32'd4;
 
                                 if (pred_taken_w[slot]) begin
-                                    sic_packet_out[i].next_pc_pred <= branch_target;
-                                    ecr_update.altpc_pc <= fall_through;
-                                    next_cycle_pc = branch_target;
-                                    branch_taken_in_packet = 1;
+                                    sic_packet_out[sic].next_pc_pred <= br_tgt;
+                                    ecr_update.altpc_pc <= fall;
+                                    next_pc = br_tgt;
+                                    cut_packet = 1'b1;
                                 end else begin
-                                    sic_packet_out[i].next_pc_pred <= fall_through;
-                                    ecr_update.altpc_pc <= branch_target;
+                                    sic_packet_out[sic].next_pc_pred <= fall;
+                                    ecr_update.altpc_pc <= br_tgt;
                                 end
                             end
-                        end else if (is_j || is_jal) begin
-                            // J/JAL：目标地址在发射端即可确定，直接改变取指 PC，并截断本包后续发射
-                            logic [31:0] current_instr_pc;
-                            logic [31:0] jump_target;
-                            current_instr_pc = pc + (slot << 2);
-                            jump_target = {
-                                current_instr_pc[31:28], dec_info[slot].jump_target, 2'b00
-                            };
-                            sic_packet_out[i].next_pc_pred <= jump_target;
-                            next_cycle_pc = jump_target;
-                            branch_taken_in_packet = 1;
-                        end else if (is_jr) begin
-                            // JR：目标地址需要等待 SIC 读取寄存器后提交
-                            // 这里停止继续发射，直到收到 pc_redirect
-                            jr_issued_this_cycle = 1;
-                            jr_waiting <= 1;
+                        end else if (!stall && (is_j || is_jal)) begin
+                            ip = pc + (slot << 2);
+                            j_tgt = {ip[31:28], dec_info[slot].jump_target, 2'b00};
+                            sic_packet_out[sic].next_pc_pred <= j_tgt;
+                            next_pc = j_tgt;
+                            cut_packet = 1'b1;
+                        end else if (!stall && is_jr) begin
+                            // JR：等待 SIC 提交重定向
+                            jr_waiting <= 1'b1;
                             jr_wait_issue_id <= global_issue_id + ID_WIDTH'(slot);
-                            // 截断本包后续发射
-                            branch_taken_in_packet = 1;
-                            // next_pc_pred 对 JR 无意义，置 X 便于调试
-                            sic_packet_out[i].next_pc_pred <= 'x;
-                        end else begin
-                            // 非分支指令
-                            // 为了便于调试：当指令不需要写 ECR 时，将 set_ecr_id 置为 X
-                            sic_packet_out[i].set_ecr_id <= 'x;
-                            sic_packet_out[i].next_pc_pred <= (pc + (instructions_issued_this_cycle << 2)) + 4;
+                            sic_packet_out[sic].next_pc_pred <= 'x;
+                            cut_packet = 1'b1;
                         end
 
-                        // 只有未发生 Stall 时才增加计数
-                        if (!issue_stall) begin
-                            instructions_issued_this_cycle++;
+                        if (!stall) begin
+                            issued++;
                         end
-
-                    end else begin
-                        // === 2. 空闲/无效逻辑 (本次修改核心) ===
-                        // 当不发射指令时：
-                        // 1. 先将整个包置为 'x (不定态)，包括所有数据字段
-                        // 2. 紧接着覆盖 valid 位为 0
-                        // 在 SystemVerilog 非阻塞赋值中，对同一变量的后一次赋值会覆盖前一次
-
-                        sic_packet_out[i]       <= 'x;  // 全部弄脏
-                        sic_packet_out[i].valid <= 0;  // 仅 Valid 设为明确的 0
-                        rf_alloc_wen[i] = 0;
-                        rf_alloc_pr[i]  = '0;
                     end
                 end
 
-                // === 3. 更新全局状态 ===
-
-                // 更新 active_ecr 寄存器
-                // 如果发生了 Stall，current_active_ecr 可能只更新了一半，或者保持原值
-                // 如果没有 Stall，它保存的是最后一条指令产生的依赖
-                if (!issue_stall) begin
-                    active_ecr <= current_active_ecr;
+                // 提交本周期 state
+                cur_state <= st_work;
+                active_ecr <= active_ecr_work;
+                global_issue_id <= global_issue_id + ID_WIDTH'(issued);
+                if (issued > 0) begin
+                    if (!jr_waiting) begin
+                        if (cut_packet) pc <= next_pc;
+                        else pc <= pc + (issued << 2);
+                    end
                 end
-
-                // 更新 Issue ID
-                global_issue_id <= global_issue_id + 16'(instructions_issued_this_cycle);
-
-                // 提交本周期滚动更新后的 RAT（包含同周期内写回带来的新映射）
-                rat <= rat_work;
-                free_bitmap <= free_bitmap_work;
-                pending_free_cnt <= pending_free_cnt_work;
-                for (int k = 0; k < NUM_PHY_REGS; k++) begin
-                    pending_free[k] <= pending_free_work[k];
-                end
-
-                // 更新 PC
-                if (jr_issued_this_cycle) begin
-                    // JR：PC 由重定向通路提交，发射端在等待期间保持不变
-                    pc <= pc;
-                end else if (branch_taken_in_packet && !issue_stall) begin
-                    pc <= next_cycle_pc;
-                end else begin
-                    // 只有当有发射指令时才推进，避免空转时乱加
-                    if (instructions_issued_this_cycle > 0)
-                        pc <= pc + (instructions_issued_this_cycle << 2);
-                end
-            end  // !jr_waiting
+            end
         end
     end
 
