@@ -41,9 +41,23 @@ module register_file #(
     // In-use bitmap: any SIC referencing a PR via rs/rt/waddr marks it in-use.
     logic [NUM_PHY_REGS-1:0] in_use;
 
+`ifndef SYNTHESIS
+    // Enable debug assertions only after reset has been released and at least one clk edge occurred.
+    logic sim_checks_en;
+`endif
+
     // 组合读：直接输出数据；由 valid 提供“是否可用”
     always_comb begin
         for (int s = 0; s < NUM_SICS; s++) begin
+`ifndef SYNTHESIS
+            // Simulation-time safety checks: any X/Z in register indices is a hard error.
+            if (sim_checks_en && $isunknown(reg_req[s].rs_addr))
+                $fatal(1, "RF: rs_addr contains X/Z (sic=%0d, rs_addr=%b)", s, reg_req[s].rs_addr);
+            if (sim_checks_en && $isunknown(reg_req[s].rt_addr))
+                $fatal(1, "RF: rt_addr contains X/Z (sic=%0d, rt_addr=%b)", s, reg_req[s].rt_addr);
+            if (sim_checks_en && $isunknown(reg_req[s].waddr))
+                $fatal(1, "RF: waddr contains X/Z (sic=%0d, waddr=%b)", s, reg_req[s].waddr);
+`endif
             // PR0 behaves like MIPS $0: always reads as 0 and always valid.
             if (reg_req[s].rs_addr == '0) begin
                 reg_ans[s].rs_rdata = 32'b0;
@@ -68,6 +82,30 @@ module register_file #(
         in_use = '0;
 
         for (int s = 0; s < NUM_SICS; s++) begin
+`ifndef SYNTHESIS
+            // Same check here because we use indices to set bits in a packed array.
+            if (sim_checks_en && $isunknown(reg_req[s].rs_addr))
+                $fatal(
+                    1,
+                    "RF: rs_addr contains X/Z while deriving in_use (sic=%0d, rs_addr=%b)",
+                    s,
+                    reg_req[s].rs_addr
+                );
+            if (sim_checks_en && $isunknown(reg_req[s].rt_addr))
+                $fatal(
+                    1,
+                    "RF: rt_addr contains X/Z while deriving in_use (sic=%0d, rt_addr=%b)",
+                    s,
+                    reg_req[s].rt_addr
+                );
+            if (sim_checks_en && $isunknown(reg_req[s].waddr))
+                $fatal(
+                    1,
+                    "RF: waddr contains X/Z while deriving in_use (sic=%0d, waddr=%b)",
+                    s,
+                    reg_req[s].waddr
+                );
+`endif
             if (reg_req[s].rs_addr != '0) in_use[reg_req[s].rs_addr] = 1'b1;
             if (reg_req[s].rt_addr != '0) in_use[reg_req[s].rt_addr] = 1'b1;
             if (reg_req[s].waddr != '0) in_use[reg_req[s].waddr] = 1'b1;
@@ -89,15 +127,27 @@ module register_file #(
     // 生命周期控制：allocate -> valid=0；commit 写回 -> valid=1
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+`ifndef SYNTHESIS
+            sim_checks_en <= 1'b0;
+`endif
             // 复位：0..31 作为架构初值映射，置为 valid=1 且值为 0
             for (int p = 0; p < NUM_PHY_REGS; p++) begin
                 regs[p] <= 32'b0;
                 vld[p]  <= (p < 32);
             end
         end else begin
+`ifndef SYNTHESIS
+            sim_checks_en <= 1'b1;
+`endif
             // 1) allocate：开启新生命周期（清 valid，data 置 X 便于调试）
             for (int s = 0; s < NUM_SICS; s++) begin
                 if (alloc_wen[s]) begin
+`ifndef SYNTHESIS
+                    if (sim_checks_en && $isunknown(alloc_pr[s]))
+                        $fatal(
+                            1, "RF: alloc_pr contains X/Z (sic=%0d, alloc_pr=%b)", s, alloc_pr[s]
+                        );
+`endif
                     // Never allocate/reset PR0 ($0). It is always valid and always 0.
                     if (alloc_pr[s] != '0) begin
                         vld[alloc_pr[s]]  <= 1'b0;
@@ -110,6 +160,25 @@ module register_file #(
             for (int s = 0; s < NUM_SICS; s++) begin
                 if (reg_req[s].wcommit) begin
 `ifndef SYNTHESIS
+                    // Simulation-time safety checks: any X/Z in write address/data is a hard error.
+                    if (sim_checks_en && $isunknown(reg_req[s].waddr))
+                        $fatal(
+                            1,
+                            "RF: write address contains X/Z (sic=%0d, waddr=%b)",
+                            s,
+                            reg_req[s].waddr
+                        );
+                    if (reg_req[s].waddr != '0) begin
+                        if (sim_checks_en && $isunknown(reg_req[s].wdata))
+                            $fatal(
+                                1,
+                                "RF: write data contains X/Z (sic=%0d, pr=%0d, wdata=%h)",
+                                s,
+                                reg_req[s].waddr,
+                                reg_req[s].wdata
+                            );
+                    end
+
                     // PR0: MIPS $0 semantics - writes are ignored (allowed any number of times).
                     // PR1..31: still reserved (illegal to write).
                     if (reg_req[s].waddr != '0) begin
