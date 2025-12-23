@@ -66,6 +66,10 @@ module single_instruction_controller #(
     logic [31:0] mem_addr_hold;  // byte addr
     logic [31:0] mem_wdata_hold;
 
+    // Abort (mispredict squash):
+    // 只要依赖的 ECR 被置为 10(Incorrect)，则无论当前处于何状态，都中止本 SIC 正在执行的指令。
+    logic abort_mispredict;
+
     // 指令分类（由 info.opcode + funct 推导，供 always_comb/always_ff 共用）
     logic op_alu_r, op_ori, op_lui, op_lw, op_sw, op_beq, op_j, op_jal, op_jr, op_syscall;
 
@@ -137,12 +141,13 @@ module single_instruction_controller #(
         // 组装 mem_req：地址/数据来自 hold 寄存器，写使能仅在提交点拉高
         mem_req.addr  = mem_addr_hold[31:2];
         mem_req.wdata = mem_wdata_hold;
-        mem_req.wen   = (state == COMMIT_WRITE) && op_sw;
+        // 注意：abort_mispredict 必须门控所有架构可见副作用，避免同一拍误提交
+        mem_req.wen   = (state == COMMIT_WRITE) && op_sw && !abort_mispredict;
 
         // 仅在提交写回状态，且确实是写寄存器类指令时，拉高 commit
         if (state == COMMIT_WRITE) begin
             if (op_alu_r || op_lw || op_ori || op_lui || op_jal) begin
-                reg_req.wcommit = need_reg_write2;
+                reg_req.wcommit = need_reg_write2 && !abort_mispredict;
             end
         end
     end
@@ -163,6 +168,9 @@ module single_instruction_controller #(
 
     // ECR 读使能：SIC 在执行一条有效指令期间，认为自己“正在依赖/读取 dep_ecr”
     assign ecr_read_en = (state != IDLE) && (state != WAIT_PACKET);
+
+    // Abort 条件：在持有有效 pkt 的期间，只要依赖 ECR==10，立即中止
+    assign abort_mispredict = ecr_read_en && (ecr_read_data == 2'b10);
 
     // 如果处于 IDLE，或者处于 WAIT 且还没收到 Valid 数据，则请求指令
     // 一旦收到 packet_in.valid，req_instr 会立即拉低，防止发射控制器在下一个沿误判
@@ -189,159 +197,164 @@ module single_instruction_controller #(
             ecr_wen           <= 0;
             pc_redirect_valid <= 0;
 
-            case (state)
-                IDLE: begin
-                    state <= WAIT_PACKET;
-                end
-
-                WAIT_PACKET: begin
-                    if (packet_in.valid) begin
-                        pkt   <= packet_in;
-                        state <= REQUEST_LOCKS;
+            // 最高优先级：若依赖 ECR 已判为 Incorrect，则无论状态立即中止
+            // 并确保本拍不会产生任何提交副作用（组合/时序路径均已门控）
+            if (abort_mispredict) begin
+                state <= RELEASE;
+            end else
+                case (state)
+                    IDLE: begin
+                        state <= WAIT_PACKET;
                     end
-                end
 
-                REQUEST_LOCKS: begin
-                    // 在此状态下，组合逻辑已经发出了所有 req 信号
-                    // 我们检查是否所有需要的 Grant 都已获得
-                    // 注意：ECR 读取现在是组合逻辑，不需要 Grant
-                    // 简化：如果所有请求的锁都 Grant，进入执行
-
-                    // ECR 读取现在是组合逻辑，不需要 Grant
-                    if (all_granted) state <= EXECUTE_READ;
-                end
-
-                EXECUTE_READ: begin
-                    // 锁已持有，读取数据是瞬时的 (Flash Read)
-                    // 准备操作数
-                    if (op_alu_r) begin
-                        op_a_val   <= reg_ans.rs_rdata;
-                        op_b_val   <= reg_ans.rt_rdata;
-                        alu_req.op <= pkt.info.funct;
-                        // 关键修复：ALU 输入不要转发 op_*_val（同一拍会拿到旧值），直接用寄存器读数据
-                        alu_req.a  <= reg_ans.rs_rdata;
-                        alu_req.b  <= reg_ans.rt_rdata;
-                    end else if (op_ori) begin
-                        op_a_val   <= reg_ans.rs_rdata;
-                        op_b_val   <= pkt.info.imm16_zero_ext;
-                        alu_req.op <= 6'h25;  // OR
-                        alu_req.a  <= reg_ans.rs_rdata;
-                        alu_req.b  <= pkt.info.imm16_zero_ext;
-                    end else if (op_beq) begin
-                        op_a_val   <= reg_ans.rs_rdata;
-                        op_b_val   <= reg_ans.rt_rdata;
-                        alu_req.op <= 6'h22;  // SUB (Check Zero)
-                        alu_req.a  <= reg_ans.rs_rdata;
-                        alu_req.b  <= reg_ans.rt_rdata;
-                    end else if (op_lw || op_sw) begin
-                        // 地址计算（内部加法，不走 ALU 资源池）
-                        op_a_val <= reg_ans.rs_rdata;  // base
-                        op_b_val <= reg_ans.rt_rdata;  // store data (sw)
-                        mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
-                        mem_wdata_hold <= reg_ans.rt_rdata;
-                        // 不使用 ALU 资源池，避免遗留旧值造成波形困惑
-                        alu_req <= '0;
-                    end else if (op_lui) begin
-                        // LUI 无需读寄存器
-                        // 保持 op_a/op_b 不用
-                        alu_req <= '0;
-                    end else if (op_jal) begin
-                        // JAL 无需读寄存器，写回在 CHECK_ECR 准备
-                        alu_req <= '0;
-                    end else if (op_jr) begin
-                        // JR 需要读取 rs 作为跳转目标
-                        op_a_val <= reg_ans.rs_rdata;
-                        alu_req  <= '0;
-                    end
-                    // ... 其他指令解码到 ALU Opcode ...
-
-                    // 可以在这里等待 ALU 结果稳定，或假设单周期
-                    state <= CHECK_ECR;
-                end
-
-                CHECK_ECR: begin
-                    // 保存计算结果
-                    result_val <= alu_ans.c;
-                    zero_val   <= alu_ans.zero;
-
-                    // 检查依赖的 ECR
-                    // ecr_read_data 是组合逻辑输出，直接可用
-                    // 约定：00=不确定(Busy), 01=预测正确, 10=预测错误
-                    if (ecr_read_data == 2'b10) begin
-                        // 预测错误！回滚 (Abort)：释放所有锁，不写回
-                        state <= RELEASE;
-                    end else if (ecr_read_data == 2'b01) begin
-                        // 预测正确，继续
-                        // 关键：提前准备好写回数据，使其在 COMMIT_WRITE 的时钟沿稳定
-                        if (op_alu_r || op_ori) begin
-                            reg_wdata_dst <= alu_ans.c;
+                    WAIT_PACKET: begin
+                        if (packet_in.valid) begin
+                            pkt   <= packet_in;
+                            state <= REQUEST_LOCKS;
                         end
-                        if (op_lui) begin
-                            reg_wdata_dst <= {pkt.info.imm16, 16'b0};
-                        end
-                        if (op_jal) begin
-                            // 约定：无延迟槽，link = PC+4
-                            reg_wdata_dst <= pkt.pc + 32'd4;
-                        end
-                        if (op_lw) begin
-                            reg_wdata_dst <= mem_rdata;
-                        end
-                        state <= COMMIT_WRITE;
-                    end
-                    // 若为 00 (Busy)，保持此状态等待
-                end
-
-                COMMIT_WRITE: begin
-                    // 执行写操作 (写 Reg 或 Mem 或 ECR)
-
-                    // 寄存器写回由 reg_req.wcommit + reg_req.wdata 在本周期时钟沿完成
-                    // reg_wdata_dst 已在 CHECK_ECR 中提前准备好，这里不再修改它，避免时序错拍
-
-                    if (op_beq) begin
-                        // 判断分支结果
-                        logic actual_taken;
-                        // 这里只支持 BEQ：ALU 做 SUB，zero_val==1 表示相等 -> taken
-                        actual_taken = zero_val;
-
-                        // 更新 ECR
-                        ecr_wen <= 1;
-                        ecr_write_addr <= pkt.set_ecr_id[$clog2(2)-1:0];  // 0-based
-                        if (actual_taken == pkt.pred_taken) ecr_wdata <= 2'b01;  // Correct
-                        else ecr_wdata <= 2'b10;  // Incorrect
-
                     end
 
-                    // JR：提交时输出 PC 重定向（issue_controller 会暂停发射直到收到它）
-                    if (op_jr) begin
-                        pc_redirect_valid <= 1;
-                        pc_redirect_pc <= op_a_val;  // rs 值已在 EXECUTE_READ 采样
-                        pc_redirect_issue_id <= pkt.issue_id;
+                    REQUEST_LOCKS: begin
+                        // 在此状态下，组合逻辑已经发出了所有 req 信号
+                        // 我们检查是否所有需要的 Grant 都已获得
+                        // 注意：ECR 读取现在是组合逻辑，不需要 Grant
+                        // 简化：如果所有请求的锁都 Grant，进入执行
+
+                        // ECR 读取现在是组合逻辑，不需要 Grant
+                        if (all_granted) state <= EXECUTE_READ;
                     end
 
-                    // SYSCALL：仿真最小实现，提交点直接结束仿真
-                    if (op_syscall) begin
+                    EXECUTE_READ: begin
+                        // 锁已持有，读取数据是瞬时的 (Flash Read)
+                        // 准备操作数
+                        if (op_alu_r) begin
+                            op_a_val   <= reg_ans.rs_rdata;
+                            op_b_val   <= reg_ans.rt_rdata;
+                            alu_req.op <= pkt.info.funct;
+                            // 关键修复：ALU 输入不要转发 op_*_val（同一拍会拿到旧值），直接用寄存器读数据
+                            alu_req.a  <= reg_ans.rs_rdata;
+                            alu_req.b  <= reg_ans.rt_rdata;
+                        end else if (op_ori) begin
+                            op_a_val   <= reg_ans.rs_rdata;
+                            op_b_val   <= pkt.info.imm16_zero_ext;
+                            alu_req.op <= 6'h25;  // OR
+                            alu_req.a  <= reg_ans.rs_rdata;
+                            alu_req.b  <= pkt.info.imm16_zero_ext;
+                        end else if (op_beq) begin
+                            op_a_val   <= reg_ans.rs_rdata;
+                            op_b_val   <= reg_ans.rt_rdata;
+                            alu_req.op <= 6'h22;  // SUB (Check Zero)
+                            alu_req.a  <= reg_ans.rs_rdata;
+                            alu_req.b  <= reg_ans.rt_rdata;
+                        end else if (op_lw || op_sw) begin
+                            // 地址计算（内部加法，不走 ALU 资源池）
+                            op_a_val <= reg_ans.rs_rdata;  // base
+                            op_b_val <= reg_ans.rt_rdata;  // store data (sw)
+                            mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
+                            mem_wdata_hold <= reg_ans.rt_rdata;
+                            // 不使用 ALU 资源池，避免遗留旧值造成波形困惑
+                            alu_req <= '0;
+                        end else if (op_lui) begin
+                            // LUI 无需读寄存器
+                            // 保持 op_a/op_b 不用
+                            alu_req <= '0;
+                        end else if (op_jal) begin
+                            // JAL 无需读寄存器，写回在 CHECK_ECR 准备
+                            alu_req <= '0;
+                        end else if (op_jr) begin
+                            // JR 需要读取 rs 作为跳转目标
+                            op_a_val <= reg_ans.rs_rdata;
+                            alu_req  <= '0;
+                        end
+                        // ... 其他指令解码到 ALU Opcode ...
+
+                        // 可以在这里等待 ALU 结果稳定，或假设单周期
+                        state <= CHECK_ECR;
+                    end
+
+                    CHECK_ECR: begin
+                        // 保存计算结果
+                        result_val <= alu_ans.c;
+                        zero_val   <= alu_ans.zero;
+
+                        // 检查依赖的 ECR
+                        // ecr_read_data 是组合逻辑输出，直接可用
+                        // 约定：00=不确定(Busy), 01=预测正确, 10=预测错误
+                        if (ecr_read_data == 2'b10) begin
+                            // 预测错误！回滚 (Abort)：释放所有锁，不写回
+                            state <= RELEASE;
+                        end else if (ecr_read_data == 2'b01) begin
+                            // 预测正确，继续
+                            // 关键：提前准备好写回数据，使其在 COMMIT_WRITE 的时钟沿稳定
+                            if (op_alu_r || op_ori) begin
+                                reg_wdata_dst <= alu_ans.c;
+                            end
+                            if (op_lui) begin
+                                reg_wdata_dst <= {pkt.info.imm16, 16'b0};
+                            end
+                            if (op_jal) begin
+                                // 约定：无延迟槽，link = PC+4
+                                reg_wdata_dst <= pkt.pc + 32'd4;
+                            end
+                            if (op_lw) begin
+                                reg_wdata_dst <= mem_rdata;
+                            end
+                            state <= COMMIT_WRITE;
+                        end
+                        // 若为 00 (Busy)，保持此状态等待
+                    end
+
+                    COMMIT_WRITE: begin
+                        // 执行写操作 (写 Reg 或 Mem 或 ECR)
+
+                        // 寄存器写回由 reg_req.wcommit + reg_req.wdata 在本周期时钟沿完成
+                        // reg_wdata_dst 已在 CHECK_ECR 中提前准备好，这里不再修改它，避免时序错拍
+
+                        if (op_beq) begin
+                            // 判断分支结果
+                            logic actual_taken;
+                            // 这里只支持 BEQ：ALU 做 SUB，zero_val==1 表示相等 -> taken
+                            actual_taken = zero_val;
+
+                            // 更新 ECR
+                            ecr_wen <= 1;
+                            ecr_write_addr <= pkt.set_ecr_id[$clog2(2)-1:0];  // 0-based
+                            if (actual_taken == pkt.pred_taken) ecr_wdata <= 2'b01;  // Correct
+                            else ecr_wdata <= 2'b10;  // Incorrect
+
+                        end
+
+                        // JR：提交时输出 PC 重定向（issue_controller 会暂停发射直到收到它）
+                        if (op_jr) begin
+                            pc_redirect_valid <= 1;
+                            pc_redirect_pc <= op_a_val;  // rs 值已在 EXECUTE_READ 采样
+                            pc_redirect_issue_id <= pkt.issue_id;
+                        end
+
+                        // SYSCALL：仿真最小实现，提交点直接结束仿真
+                        if (op_syscall) begin
 `ifndef SYNTHESIS
-                        $display("[SIC%0d] SYSCALL at PC=%h, finishing simulation.", SIC_ID,
-                                 pkt.pc);
-                        $finish;
+                            $display("[SIC%0d] SYSCALL at PC=%h, finishing simulation.", SIC_ID,
+                                     pkt.pc);
+                            $finish;
 `endif
+                        end
+
+                        // 同步写在时钟沿生效，下一状态释放
+                        state <= RELEASE;
                     end
 
-                    // 同步写在时钟沿生效，下一状态释放
-                    state <= RELEASE;
-                end
+                    RELEASE: begin
+                        // 发出释放信号
+                        // 注意：这里不能依赖 reg_req_*/mem_req_*/alu_req，
+                        // 因为这些 req 信号在 RELEASE 状态会被组合逻辑门控为 0。
+                        if (need_mem_read || need_mem_write) mem_release_pulse <= 1;
+                        if (need_alu) alu_release_pulse <= 1;
+                        // ECR 不再需要释放信号
 
-                RELEASE: begin
-                    // 发出释放信号
-                    // 注意：这里不能依赖 reg_req_*/mem_req_*/alu_req，
-                    // 因为这些 req 信号在 RELEASE 状态会被组合逻辑门控为 0。
-                    if (need_mem_read || need_mem_write) mem_release_pulse <= 1;
-                    if (need_alu) alu_release_pulse <= 1;
-                    // ECR 不再需要释放信号
-
-                    state <= IDLE;
-                end
-            endcase
+                        state <= IDLE;
+                    end
+                endcase
         end
     end
 
