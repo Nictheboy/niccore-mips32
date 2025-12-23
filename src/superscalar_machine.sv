@@ -10,9 +10,9 @@ module superscalar_machine (
     // =========================================================
     // 参数定义
     // =========================================================
-    localparam int NUM_SICS = 2;
+    localparam int NUM_SICS = 8;
     localparam int NUM_PHY_REGS = 64;
-    localparam int NUM_ALUS = 4;
+    localparam int NUM_ALUS = 8;
     localparam int NUM_ECRS = 2;  // 新增
     localparam int ID_WIDTH = 16;
     localparam int TOTAL_REG_PORTS = NUM_SICS * 3;
