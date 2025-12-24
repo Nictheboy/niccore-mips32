@@ -16,8 +16,8 @@
 `include "structs.svh"
 
 module register_file #(
-    parameter int NUM_PHY_REGS = 64,
-    parameter int NUM_SICS     = 2
+    parameter int NUM_PHY_REGS,
+    parameter int NUM_SICS
 ) (
     input logic clk,
     input logic rst_n,

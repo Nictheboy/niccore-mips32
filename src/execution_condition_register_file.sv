@@ -17,9 +17,9 @@
  */
 
 module execution_condition_register_file #(
-    parameter int NUM_ECRS = 2,
-    parameter int NUM_SICS = 2,
-    parameter int ID_WIDTH = 16
+    parameter int NUM_ECRS,
+    parameter int NUM_SICS,
+    parameter int ID_WIDTH
 ) (
     input logic clk,
     input logic rst_n,

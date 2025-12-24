@@ -13,9 +13,15 @@ module superscalar_machine (
     localparam int NUM_SICS = 8;
     localparam int NUM_PHY_REGS = 64;
     localparam int NUM_ALUS = 8;
-    localparam int NUM_ECRS = 2;  // 新增
+    localparam int NUM_ECRS = 2;
     localparam int ID_WIDTH = 16;
     localparam int TOTAL_REG_PORTS = NUM_SICS * 3;
+    localparam int BRANCH_PREDICTOR_TABLE_SIZE = 64;
+    localparam int IMEM_DEPTH = 1024;
+    localparam logic [31:0] IMEM_START_BYTE_ADDR = 32'h0000_3000;
+    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/mips1.txt";
+    localparam int DMEM_DEPTH = 2048;
+    localparam int DMEM_NUM_BANKS = 4;
 
     // =========================================================
     // 互联信号定义
@@ -78,9 +84,9 @@ module superscalar_machine (
 
     // 1. 指令内存
     instruction_memory #(
-        .MEM_DEPTH(1024),
-        .START_BYTE_ADDR(32'h0000_3000),
-        .INIT_FILE("/home/nictheboy/Documents/niccore-mips32/test/mips1.txt"),
+        .MEM_DEPTH(IMEM_DEPTH),
+        .START_BYTE_ADDR(IMEM_START_BYTE_ADDR),
+        .INIT_FILE(IMEM_INIT_FILE),
         .FETCH_WIDTH(NUM_SICS)
     ) imem (
         .reset(~rst_n),
@@ -94,7 +100,7 @@ module superscalar_machine (
         .NUM_SICS(NUM_SICS),
         .NUM_PHY_REGS(NUM_PHY_REGS),
         .ID_WIDTH(ID_WIDTH),
-        .BRANCH_PREDICTOR_TABLE_SIZE(64)
+        .BRANCH_PREDICTOR_TABLE_SIZE(BRANCH_PREDICTOR_TABLE_SIZE)
     ) issuer (
         .clk(clk),
         .rst_n(rst_n),
@@ -186,7 +192,8 @@ module superscalar_machine (
 
     // 5. 数据内存
     data_memory_with_lock #(
-        .MEM_DEPTH(2048),
+        .MEM_DEPTH(DMEM_DEPTH),
+        .NUM_BANKS(DMEM_NUM_BANKS),
         .NUM_PORTS(NUM_SICS),
         .ID_WIDTH (ID_WIDTH)
     ) dmem (

@@ -11,8 +11,8 @@
 `include "structs.svh"
 
 module alu_array_with_lock #(
-    parameter int NUM_ALUS  = 4,
-    parameter int NUM_PORTS = 4,  // SIC 数量
+    parameter int NUM_ALUS,
+    parameter int NUM_PORTS,  // SIC 数量
     parameter int ID_WIDTH  = 16
 ) (
     input logic clk,

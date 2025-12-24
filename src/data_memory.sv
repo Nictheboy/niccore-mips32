@@ -7,7 +7,7 @@
 `include "structs.svh"
 
 module data_memory #(
-    parameter MEM_DEPTH = 2048  // 改为 parameter，默认值保持 2048
+    parameter MEM_DEPTH
 ) (
     input reset,
     input clock,
