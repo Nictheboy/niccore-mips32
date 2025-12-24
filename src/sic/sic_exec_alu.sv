@@ -26,8 +26,6 @@ module sic_exec_alu #(
     typedef enum logic [3:0] {
         WAIT_PACKET,
         REQUEST_LOCKS,
-        EXECUTE_READ,
-        CHECK_ECR,
         COMMIT_WRITE
     } state_t;
 
@@ -51,7 +49,6 @@ module sic_exec_alu #(
 
     // Reg 写回数据保持
     logic [31:0] reg_wdata_dst;
-    alu_req_t alu_req;
     sic_packet_t pkt_v;
 
     // 组合逻辑计算锁请求
@@ -78,10 +75,16 @@ module sic_exec_alu #(
         // ALU lock + request
         out.alu_rpl.req_issue_id = pkt.issue_id;
         out.alu_rpl.release_lock = alu_release_pulse;
-        if (state == REQUEST_LOCKS || state == EXECUTE_READ || state == CHECK_ECR || state == COMMIT_WRITE) begin
+        if (state == REQUEST_LOCKS || state == COMMIT_WRITE) begin
             out.alu_rpl.req = need_alu;
         end
-        out.alu_req = alu_req;
+        // ALU 请求：纯组合生成（保证在 REQUEST_LOCKS 满足条件时，同拍就能得到 alu_ans）
+        out.alu_req.op = pkt_v.info.alu_op;
+        out.alu_req.a = reg_ans.rs_rdata;
+        out.alu_req.b  = pkt_v.info.alu_b_is_imm
+                         ? (pkt_v.info.alu_imm_is_zero_ext ? pkt_v.info.imm16_zero_ext
+                                                         : pkt_v.info.imm16_sign_ext)
+                         : reg_ans.rt_rdata;
 
         // 外部资源请求策略：
         // - ALU：持有直到提交（COMMIT_WRITE）/丢弃（abort）
@@ -115,7 +118,6 @@ module sic_exec_alu #(
             alu_release_pulse <= 0;
             ecr_wen <= 0;
             reg_wdata_dst <= 32'b0;
-            alu_req <= '0;
         end else begin
             // 默认清除单周期脉冲
             alu_release_pulse <= 0;
@@ -135,39 +137,16 @@ module sic_exec_alu #(
                     end
 
                     REQUEST_LOCKS: begin
-                        // 等待所需资源满足
-                        if (all_granted) state <= EXECUTE_READ;
-                    end
-
-                    EXECUTE_READ: begin
-                        // 准备操作数/请求
-                        if (need_alu) begin
-                            alu_req.op <= pkt.info.alu_op;
-                            alu_req.a <= reg_ans.rs_rdata;
-                            alu_req.b  <= pkt.info.alu_b_is_imm
-                                         ? (pkt.info.alu_imm_is_zero_ext ? pkt.info.imm16_zero_ext
-                                                                         : pkt.info.imm16_sign_ext)
-                                         : reg_ans.rt_rdata;
-                        end
-                        // 单周期进入下一阶段
-                        state <= CHECK_ECR;
-                    end
-
-                    CHECK_ECR: begin
                         // 约定：00=Busy, 01=Correct, 10=Incorrect
-                        if (!pkt.dep_ecr_id[1]) begin
-                            reg_wdata_dst <= in.alu_ans.c;
-                            zero_val      <= in.alu_ans.zero;
-                            state         <= COMMIT_WRITE;
-                        end else if (in.ecr_read_data == 2'b10) begin
-                            if (need_alu) alu_release_pulse <= 1;
-                            state <= WAIT_PACKET;
-                        end else if (in.ecr_read_data == 2'b01) begin
-                            reg_wdata_dst <= in.alu_ans.c;
-                            zero_val      <= in.alu_ans.zero;
-                            state         <= COMMIT_WRITE;
+                        if (all_granted) begin
+                            if (!pkt.dep_ecr_id[1] || (in.ecr_read_data == 2'b01)) begin
+                                reg_wdata_dst <= in.alu_ans.c;
+                                zero_val      <= in.alu_ans.zero;
+                                state         <= COMMIT_WRITE;
+                            end
+                            // dep_valid==1 且 ecr==00：保持等待
+                            // dep_valid==1 且 ecr==10：由 abort_mispredict 分支统一处理
                         end
-                        // 00: Busy，保持等待
                     end
 
                     COMMIT_WRITE: begin
