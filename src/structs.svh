@@ -1,9 +1,9 @@
 // =========================================================
-// Global shared types (struct/enum/class typedefs)
+// Global shared types
 // =========================================================
 // 约定：
-// - 所有需要跨模块复用的“全局结构体/类型定义”集中放在这里
-// - 不使用 `type`（关键字）作为成员/typedef 名称；统一使用 `t`
+// - 跨模块复用的类型统一放在这里
+// - class 仅用于封装 typedef struct packed（便于参数化）
 
 `ifndef STRUCTS_SVH
 `define STRUCTS_SVH
@@ -22,7 +22,7 @@ class rpl_req #(
 endclass
 
 // -----------------------------
-// MIPS opcode enum (for decode/debug)
+// MIPS opcode enum
 // -----------------------------
 typedef enum logic [5:0] {
     OPC_INVALID,
@@ -37,15 +37,42 @@ typedef enum logic [5:0] {
 } opcode_t;
 
 // -----------------------------
+// Writeback select
+// -----------------------------
+typedef enum logic [2:0] {
+    WB_NONE,  // no GPR writeback
+    WB_ALU,   // write alu result
+    WB_LUI,   // write {imm16, 16'b0}
+    WB_LINK,  // write PC+4
+    WB_MEM    // write memory read data
+} wb_sel_t;
+
+// -----------------------------
+// Control-flow kind
+// -----------------------------
+typedef enum logic [1:0] {
+    CF_NONE,      // not a control-flow instruction
+    CF_BRANCH,    // conditional branch (BEQ)
+    CF_JUMP_IMM,  // jump by immediate target (J/JAL)
+    CF_JUMP_REG   // jump by register (JR)
+} cf_kind_t;
+
+// -----------------------------
+// Destination field kind (optional debug)
+// -----------------------------
+typedef enum logic [1:0] {
+    DST_NONE,  // no architectural dst field
+    DST_RT,    // dst is RT field (I-type writes)
+    DST_RD     // dst is RD field (R-type writes)
+} dst_field_t;
+
+// -----------------------------
 // Decoded instruction info
+// - 字段 rs/rt/rd/funct/imm/jtarget 为原始提取
+// - 其余为执行意图（读写/资源/写回/控制流）
 // -----------------------------
 typedef struct packed {
     opcode_t     opcode;          // 指令 opcode（枚举）
-    logic        is_branch;       // 是否为分支指令（当前仅 BEQ）
-    // 字段有效性（用于发射端重命名/调试）
-    logic        rs_valid;
-    logic        rt_valid;
-    logic        rd_valid;
     logic [4:0]  rs;
     logic [4:0]  rt;
     logic [4:0]  rd;
@@ -54,6 +81,33 @@ typedef struct packed {
     logic [31:0] imm16_sign_ext;
     logic [31:0] imm16_zero_ext;
     logic [25:0] jump_target;
+
+    // 执行意图
+    cf_kind_t   cf_kind;
+    logic       read_rs;    // needs RS read value
+    logic       read_rt;    // needs RT read value
+    logic       write_gpr;  // will commit a GPR write
+    logic [4:0] dst_lr;     // destination logical register (valid iff write_gpr)
+    dst_field_t dst_field;  // dst 来自 rt/rd（可选调试用）
+
+    // ALU usage (only for alu_r/ori/beq in current core)
+    logic       use_alu;
+    logic [5:0] alu_op;
+    logic       alu_b_is_imm;
+    logic       alu_imm_is_zero_ext;
+
+    // Memory usage
+    logic mem_read;
+    logic mem_write;
+
+    // Branch metadata
+    logic write_ecr;  // BEQ updates ECR
+
+    // System
+    logic is_syscall;
+
+    // Writeback source
+    wb_sel_t wb_sel;
 } instr_info_t;
 
 // -----------------------------

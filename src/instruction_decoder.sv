@@ -1,15 +1,10 @@
 /*
- * Description :
+ * Instruction decoder
  *
- * Instruction decoder with Packed Structs.
- * 
- * Only support the following instructions:
+ * Supported instructions:
  * - R-Type: addu, subu, jr, syscall
  * - I-Type: ori, lw, sw, beq, lui
  * - J-Type: j, jal
- *
- * Author      : nictheboy <nictheboy@outlook.com>
- * Refactored  : 2025/12/15 (Packed into structs)
  */
 
 `include "structs.svh"
@@ -42,82 +37,125 @@ module instruction_decoder (
     output instr_info_t        info    // 包含 opcode/分支标志/寄存器索引/立即数
 );
 
-    // =========================================================
-    // 基础解码
-    // =========================================================
+    // ---------------------------------------------------------
+    // 基础字段
+    // ---------------------------------------------------------
     wire [5:0] opcode_raw = instr[31:26];
     wire [5:0] func_code = instr[5:0];
-    wire       is_r_type = (opcode_raw == 6'b000000);
+
+    // opcode 解码：未知 opcode 统一归为 OPC_INVALID
+    opcode_t opc;
+    assign opc = opcode_enum(opcode_raw);
+
+    wire is_r_type = (opc == OPC_SPECIAL);
 
     // =========================================================
     // 指令判定逻辑 (Internal Wires)
     // =========================================================
 
     // R-Type 具体功能判定
-    wire       is_addu = is_r_type && (func_code == 6'h21);
-    wire       is_subu = is_r_type && (func_code == 6'h23);
-    wire       is_jr = is_r_type && (func_code == 6'h08);
-    wire       is_syscall = is_r_type && (func_code == 6'h0c);
+    wire is_addu = is_r_type && (func_code == 6'h21);
+    wire is_subu = is_r_type && (func_code == 6'h23);
+    wire is_jr = is_r_type && (func_code == 6'h08);
+    wire is_syscall = is_r_type && (func_code == 6'h0c);
 
     // I/J-Type 判定
-    wire       is_ori = (opcode_raw == 6'h0d);
-    wire       is_lui = (opcode_raw == 6'h0f);
-    wire       is_lw = (opcode_raw == 6'h23);
-    wire       is_sw = (opcode_raw == 6'h2b);
-    wire       is_beq = (opcode_raw == 6'h04);
-    wire       is_j = (opcode_raw == 6'h02);
-    wire       is_jal = (opcode_raw == 6'h03);
+    wire is_ori = (opc == OPC_ORI);
+    wire is_lui = (opc == OPC_LUI);
+    wire is_lw = (opc == OPC_LW);
+    wire is_sw = (opc == OPC_SW);
+    wire is_beq = (opc == OPC_BEQ);
+    wire is_j = (opc == OPC_J);
+    wire is_jal = (opc == OPC_JAL);
 
-    wire       is_alu_r = is_addu | is_subu;
+    wire is_alu_r = is_addu | is_subu;
+
+    // 写回选择
+    wb_sel_t wb_sel_int;
+
+    // 目的逻辑寄存器号（用于重命名/执行）
+    wire write_gpr_int = is_alu_r | is_ori | is_lui | is_lw | is_jal;
+    wire [4:0] dst_lr_int =
+        is_alu_r ? instr[15:11] :
+        is_jal   ? 5'd31 :
+        (is_ori | is_lui | is_lw) ? instr[20:16] :
+        5'd0;
+
+    // 目的字段类型（调试用）
+    dst_field_t dst_field_int;
+    always_comb begin
+        dst_field_int = DST_NONE;
+        if (is_alu_r) dst_field_int = DST_RD;
+        else if (is_ori || is_lui || is_lw) dst_field_int = DST_RT;
+    end
+
+    // 源寄存器读取需求
+    wire read_rs_int = is_alu_r | is_jr | is_ori | is_lw | is_sw | is_beq;
+    wire read_rt_int = is_alu_r | is_sw | is_beq;
+
+    // 资源/执行意图
+    wire use_alu_int = is_alu_r | is_ori | is_beq;
+    wire mem_read_int = is_lw;
+    wire mem_write_int = is_sw;
+    wire write_ecr_int = is_beq;
+
+    // ALU 控制（use_alu_int=1 时有效）
+    wire [5:0] alu_op_int = is_alu_r ? func_code : is_ori ? 6'h25 :  // OR
+    is_beq ? 6'h22 :  // SUB (check zero)
+    6'h00;
+    wire alu_b_is_imm_int = is_ori;
+    wire alu_imm_is_zero_ext_int = is_ori;
+
+    // 写回来源
+    always_comb begin
+        wb_sel_int = WB_NONE;
+        if (is_lw) wb_sel_int = WB_MEM;
+        else if (is_lui) wb_sel_int = WB_LUI;
+        else if (is_jal) wb_sel_int = WB_LINK;
+        else if (is_alu_r || is_ori) wb_sel_int = WB_ALU;
+    end
+
+    // 控制流类型
+    cf_kind_t cf_kind_int;
+    always_comb begin
+        cf_kind_int = CF_NONE;
+        if (is_beq) cf_kind_int = CF_BRANCH;
+        else if (is_j || is_jal) cf_kind_int = CF_JUMP_IMM;
+        else if (is_jr) cf_kind_int = CF_JUMP_REG;
+    end
 
 
-    // =========================================================
-    // 字段有效性掩码 (Validity Masks)
-    // =========================================================
+    // ---------------------------------------------------------
+    // 输出
+    // ---------------------------------------------------------
 
-    // RS: alu_r, jr, ori, lw, sw, beq
-    wire       rs_valid_int = is_alu_r | is_jr | is_ori | is_lw | is_sw | is_beq;
+    assign info.opcode              = opc;
+    assign info.rs                  = instr[25:21];
+    assign info.rt                  = instr[20:16];
+    assign info.rd                  = instr[15:11];
+    assign info.funct               = instr[5:0];
+    assign info.imm16               = instr[15:0];
+    assign info.imm16_sign_ext      = {{16{instr[15]}}, instr[15:0]};
+    assign info.imm16_zero_ext      = {16'b0, instr[15:0]};
+    assign info.jump_target         = instr[25:0];
 
-    // RT: alu_r, ori, lw, sw, beq, lui (as destination)
-    wire       rt_valid_int = is_alu_r | is_ori | is_lw | is_sw | is_beq | is_lui;
+    assign info.cf_kind             = cf_kind_int;
+    assign info.read_rs             = read_rs_int;
+    assign info.read_rt             = read_rt_int;
+    assign info.write_gpr           = write_gpr_int;
+    assign info.dst_lr              = write_gpr_int ? dst_lr_int : 5'd0;
+    assign info.dst_field           = dst_field_int;
 
-    // RD: op_alu_r only
-    wire       rd_valid_int = is_alu_r;
+    assign info.use_alu             = use_alu_int;
+    assign info.alu_op              = alu_op_int;
+    assign info.alu_b_is_imm        = alu_b_is_imm_int;
+    assign info.alu_imm_is_zero_ext = alu_imm_is_zero_ext_int;
 
-    // Funct: R-Type only
-    wire       funct_valid = is_r_type;
+    assign info.mem_read            = mem_read_int;
+    assign info.mem_write           = mem_write_int;
+    assign info.write_ecr           = write_ecr_int;
 
-    // Imm16: I-Type
-    wire       imm_valid = is_ori | is_lw | is_sw | is_beq | is_lui;
-
-    // Sign Ext: lw, sw, beq
-    wire       sext_valid = is_lw | is_sw | is_beq;
-
-    // Zero Ext: ori
-    wire       zext_valid = is_ori;
-
-    // Jump Target: j, jal
-    wire       jtarget_valid = is_j | is_jal;
-
-    // =========================================================
-    // 结构体输出赋值: 解码信息 (Decoded Info)
-    // =========================================================
-
-    assign info.opcode = opcode_enum(opcode_raw);
-    assign info.is_branch = is_beq;
-    assign info.rs_valid = rs_valid_int;
-    assign info.rt_valid = rt_valid_int;
-    assign info.rd_valid = rd_valid_int;
-
-    assign info.rs    = rs_valid_int    ? instr[25:21] : 5'bx;
-    assign info.rt    = rt_valid_int    ? instr[20:16] : 5'bx;
-    assign info.rd    = rd_valid_int    ? instr[15:11] : 5'bx;
-    assign info.funct = funct_valid ? instr[5:0]   : 6'bx;
-    assign info.imm16 = imm_valid   ? instr[15:0]  : 16'bx;
-
-    assign info.imm16_sign_ext = sext_valid ? {{16{instr[15]}}, instr[15:0]} : 32'bx;
-    assign info.imm16_zero_ext = zext_valid ? {16'b0, instr[15:0]} : 32'bx;
-
-    assign info.jump_target    = jtarget_valid ? instr[25:0] : 26'bx;
+    assign info.is_syscall          = is_syscall;
+    assign info.wb_sel              = wb_sel_int;
 
 endmodule
