@@ -26,7 +26,6 @@ module sic_exec_mem #(
     typedef enum logic [3:0] {
         WAIT_PACKET,
         REQUEST_LOCKS,
-        EXECUTE_READ,
         MEM_ACCESS
     } state_t;
 
@@ -117,26 +116,16 @@ module sic_exec_mem #(
 
                     REQUEST_LOCKS: begin
                         // 等待所需资源满足
-                        if (all_granted) state <= EXECUTE_READ;
-                    end
-
-                    EXECUTE_READ: begin
-                        // 地址计算
-                        if (need_mem_read || need_mem_write) begin
-                            // 地址计算（内部加法）
-                            mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
-                            mem_wdata_hold <= reg_ans.rt_rdata;
-                        end
                         // 约定：00=Busy, 01=Correct, 10=Incorrect
-                        if (!pkt.dep_ecr_id[1]) begin
-                            state <= MEM_ACCESS;
-                        end else if (in.ecr_read_data == 2'b10) begin
-                            state <= WAIT_PACKET;
-                        end else if (in.ecr_read_data == 2'b01) begin
-                            state <= MEM_ACCESS;
-                        end else begin
-                            // 00: Busy，保持等待（不额外消耗 CHECK_ECR 周期）
-                            state <= EXECUTE_READ;
+                        if (all_granted) begin
+                            if (!pkt.dep_ecr_id[1] || (in.ecr_read_data == 2'b01)) begin
+                                // 地址计算（内部加法）
+                                mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
+                                mem_wdata_hold <= reg_ans.rt_rdata;
+                                state <= MEM_ACCESS;
+                            end
+                            // dep_valid==1 且 ecr==00：保持等待
+                            // dep_valid==1 且 ecr==10：由 abort_mispredict 分支统一处理
                         end
                     end
 
