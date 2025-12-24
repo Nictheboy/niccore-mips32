@@ -1,0 +1,81 @@
+/*
+ * Description :
+ *
+ * Imm/No-RS 子 SIC（ready-bit 风格）。
+ *
+ * 覆盖指令族：
+ * - LUI：WB_LUI
+ * - J / JAL：CF_JUMP_IMM（JAL 通过 WB_LINK 写回）
+ * - 以及其它不需要读取 RS/RT、也不需要产生重定向的“简单指令”（默认作为兜底）
+ *
+ * 规则：
+ * - 只在 dep_ecr 有效时等待 ECR==01；ECR==10 则丢弃。
+ * - `req_instr` 必须在 `packet_in.valid==1` 的周期保持为 0，避免 issue 连发导致丢包。
+ */
+
+`include "structs.svh"
+
+module sic_exec_imm #(
+    parameter int SIC_ID,
+    parameter int NUM_PHY_REGS,
+    parameter int ID_WIDTH
+) (
+    input logic clk,
+    input logic rst_n,
+    input sic_sub_in#(NUM_PHY_REGS, ID_WIDTH)::t in,
+    output sic_sub_out#(NUM_PHY_REGS, ID_WIDTH)::t out
+);
+
+    sic_packet_t packet_in;
+    assign packet_in = in.pkt;
+
+    logic busy;
+    sic_packet_t pkt;
+
+    logic abort_mispredict;
+    logic ecr_ok;
+    logic commit_now;
+
+    always_comb begin
+        out = '0;
+
+        ecr_ok = (!pkt.dep_ecr_id[1]) || (in.ecr_read_data == 2'b01);
+
+        out.ecr_read_addr = pkt.dep_ecr_id[0];
+        out.ecr_read_en = busy && pkt.dep_ecr_id[1];
+        abort_mispredict = out.ecr_read_en && (in.ecr_read_data == 2'b10);
+
+        out.req_instr = !busy && !packet_in.valid;
+
+        commit_now = busy && ecr_ok && !abort_mispredict;
+
+        out.reg_req = '0;
+        unique case (pkt.info.wb_sel)
+            WB_LUI:  out.reg_req.wdata = {pkt.info.imm16, 16'b0};
+            WB_LINK: out.reg_req.wdata = pkt.pc + 32'd4;
+            default: out.reg_req.wdata = 32'b0;
+        endcase
+        out.reg_req.wcommit = commit_now && pkt.info.write_gpr;
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            busy <= 1'b0;
+            pkt  <= '0;
+        end else begin
+            if (!busy) begin
+                if (packet_in.valid) begin
+                    pkt  <= packet_in;
+                    busy <= 1'b1;
+                end
+            end else begin
+                if (abort_mispredict || commit_now) begin
+                    busy <= 1'b0;
+                end
+            end
+        end
+    end
+
+endmodule
+
+

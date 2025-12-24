@@ -46,40 +46,52 @@ module single_instruction_controller #(
 );
 
     // 选择子 SIC：接收 packet 的当拍用组合选择，后续用寄存选择保持稳定
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         SEL_ALU,
         SEL_MEM,
-        SEL_SIMPLE
+        SEL_IMM,
+        SEL_JR,
+        SEL_SYSCALL
     } sel_t;
     sel_t sel_r, sel_now;
 
-    logic kind_mem, kind_alu;
+    logic kind_mem, kind_alu, kind_syscall, kind_jr, kind_imm;
     assign kind_mem = packet_in.valid && (packet_in.info.mem_read || packet_in.info.mem_write);
     assign kind_alu = packet_in.valid && !kind_mem && (packet_in.info.use_alu || packet_in.info.write_ecr);
+    assign kind_syscall = packet_in.valid && !kind_mem && !kind_alu && packet_in.info.is_syscall;
+    assign kind_jr = packet_in.valid && !kind_mem && !kind_alu && !kind_syscall &&
+                     (packet_in.info.cf_kind == CF_JUMP_REG);
+    assign kind_imm = packet_in.valid && !kind_mem && !kind_alu && !kind_syscall && !kind_jr;
     always_comb begin
         if (packet_in.valid) begin
             if (kind_mem) sel_now = SEL_MEM;
             else if (kind_alu) sel_now = SEL_ALU;
-            else sel_now = SEL_SIMPLE;
+            else if (kind_syscall) sel_now = SEL_SYSCALL;
+            else if (kind_jr) sel_now = SEL_JR;
+            else sel_now = SEL_IMM;
         end else begin
             sel_now = sel_r;
         end
     end
 
     // gated packets
-    sic_packet_t pkt_alu, pkt_mem, pkt_simple;
+    sic_packet_t pkt_alu, pkt_mem, pkt_imm, pkt_jr, pkt_syscall;
     always_comb begin
         pkt_alu = packet_in;
         pkt_mem = packet_in;
-        pkt_simple = packet_in;
+        pkt_imm = packet_in;
+        pkt_jr = packet_in;
+        pkt_syscall = packet_in;
         pkt_alu.valid = packet_in.valid && (sel_now == SEL_ALU);
         pkt_mem.valid = packet_in.valid && (sel_now == SEL_MEM);
-        pkt_simple.valid = packet_in.valid && (sel_now == SEL_SIMPLE);
+        pkt_imm.valid = packet_in.valid && (sel_now == SEL_IMM);
+        pkt_jr.valid = packet_in.valid && (sel_now == SEL_JR);
+        pkt_syscall.valid = packet_in.valid && (sel_now == SEL_SYSCALL);
     end
 
     // 子 SIC bundle
-    sic_sub_in #(NUM_PHY_REGS, ID_WIDTH)::t in_alu, in_mem, in_simple;
-    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH)::t out_alu, out_mem, out_simple;
+    sic_sub_in #(NUM_PHY_REGS, ID_WIDTH)::t in_alu, in_mem, in_imm, in_jr, in_syscall;
+    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH)::t out_alu, out_mem, out_imm, out_jr, out_syscall;
     sic_sub_out #(NUM_PHY_REGS, ID_WIDTH)::t out_sel;
 
     // 保存最近一次接收到的 packet（用于 PR 占用声明在后续周期持续有效）
@@ -88,35 +100,51 @@ module single_instruction_controller #(
     always_comb begin
         in_alu = '0;
         in_mem = '0;
-        in_simple = '0;
+        in_imm = '0;
+        in_jr = '0;
+        in_syscall = '0;
 
         in_alu.pkt = pkt_alu;
         in_mem.pkt = pkt_mem;
-        in_simple.pkt = pkt_simple;
+        in_imm.pkt = pkt_imm;
+        in_jr.pkt = pkt_jr;
+        in_syscall.pkt = pkt_syscall;
 
         in_alu.reg_ans = reg_ans;
         in_mem.reg_ans = reg_ans;
-        in_simple.reg_ans = reg_ans;
+        in_imm.reg_ans = reg_ans;
+        in_jr.reg_ans = reg_ans;
+        in_syscall.reg_ans = reg_ans;
 
         in_alu.mem_rdata = mem_rdata;
         in_mem.mem_rdata = mem_rdata;
-        in_simple.mem_rdata = mem_rdata;
+        in_imm.mem_rdata = mem_rdata;
+        in_jr.mem_rdata = mem_rdata;
+        in_syscall.mem_rdata = mem_rdata;
 
         in_alu.mem_grant = mem_grant;
         in_mem.mem_grant = mem_grant;
-        in_simple.mem_grant = mem_grant;
+        in_imm.mem_grant = mem_grant;
+        in_jr.mem_grant = mem_grant;
+        in_syscall.mem_grant = mem_grant;
 
         in_alu.alu_ans = alu_ans;
         in_mem.alu_ans = alu_ans;
-        in_simple.alu_ans = alu_ans;
+        in_imm.alu_ans = alu_ans;
+        in_jr.alu_ans = alu_ans;
+        in_syscall.alu_ans = alu_ans;
 
         in_alu.alu_grant = alu_grant;
         in_mem.alu_grant = alu_grant;
-        in_simple.alu_grant = alu_grant;
+        in_imm.alu_grant = alu_grant;
+        in_jr.alu_grant = alu_grant;
+        in_syscall.alu_grant = alu_grant;
 
         in_alu.ecr_read_data = ecr_read_data;
         in_mem.ecr_read_data = ecr_read_data;
-        in_simple.ecr_read_data = ecr_read_data;
+        in_imm.ecr_read_data = ecr_read_data;
+        in_jr.ecr_read_data = ecr_read_data;
+        in_syscall.ecr_read_data = ecr_read_data;
     end
 
     sic_exec_alu #(
@@ -141,26 +169,51 @@ module single_instruction_controller #(
         .out(out_mem)
     );
 
-    sic_exec_simple #(
+    sic_exec_imm #(
         .SIC_ID(SIC_ID),
         .NUM_PHY_REGS(NUM_PHY_REGS),
         .ID_WIDTH(ID_WIDTH)
-    ) u_simple (
+    ) u_imm (
         .clk(clk),
         .rst_n(rst_n),
-        .in(in_simple),
-        .out(out_simple)
+        .in(in_imm),
+        .out(out_imm)
+    );
+
+    sic_exec_jr #(
+        .SIC_ID(SIC_ID),
+        .NUM_PHY_REGS(NUM_PHY_REGS),
+        .ID_WIDTH(ID_WIDTH)
+    ) u_jr (
+        .clk(clk),
+        .rst_n(rst_n),
+        .in(in_jr),
+        .out(out_jr)
+    );
+
+    sic_exec_syscall #(
+        .SIC_ID(SIC_ID),
+        .NUM_PHY_REGS(NUM_PHY_REGS),
+        .ID_WIDTH(ID_WIDTH)
+    ) u_syscall (
+        .clk(clk),
+        .rst_n(rst_n),
+        .in(in_syscall),
+        .out(out_syscall)
     );
 
     // 顶层 req_instr：仅当所有子 SIC 均在等待指令时才请求
-    assign req_instr = out_alu.req_instr & out_mem.req_instr & out_simple.req_instr;
+    assign req_instr = out_alu.req_instr & out_mem.req_instr & out_imm.req_instr & out_jr.req_instr &
+                       out_syscall.req_instr;
 
     // 选择输出 bundle（当拍优先使用 sel_now）
     always_comb begin
         unique case (sel_now)
             SEL_ALU: out_sel = out_alu;
             SEL_MEM: out_sel = out_mem;
-            default: out_sel = out_simple;
+            SEL_JR: out_sel = out_jr;
+            SEL_SYSCALL: out_sel = out_syscall;
+            default: out_sel = out_imm;
         endcase
     end
 
@@ -200,7 +253,7 @@ module single_instruction_controller #(
     // 选择寄存：指令进入执行后保持 sel，不依赖 packet_in
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            sel_r <= SEL_SIMPLE;
+            sel_r <= SEL_IMM;
             pkt_hold <= '0;
         end else begin
             if (packet_in.valid) begin
@@ -208,7 +261,7 @@ module single_instruction_controller #(
                 pkt_hold <= packet_in;
             end else if (req_instr) begin
                 // 全部子 SIC 均在请求指令 => 当前无在飞指令
-                sel_r <= SEL_SIMPLE;
+                sel_r <= SEL_IMM;
             end
         end
     end

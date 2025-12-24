@@ -1,3 +1,21 @@
+/*
+ * Description :
+ *
+ * Mem 子 SIC（ready-bit 风格）。
+ *
+ * 执行模型：
+ * - 用 `busy` / `mem_wait` 两个寄存器描述“是否有在飞指令 / 是否已进入访存阶段”。
+ * - 其余“阶段”不显式编码，而是用 ready 条件组合推导：
+ *   - `rf_ok`：所需的源寄存器值已就绪（reg_ans.*_valid=1 时数据可用）
+ *   - `ecr_ok`：不依赖 ECR，或依赖的 ECR 已为 01
+ *   - `abort_mispredict`：依赖的 ECR 为 10，则丢弃当前指令
+ *
+ * 时序要点：
+ * - Issue->SIC 的 `packet_in` 是寄存输出；SIC 在同一时钟沿无法立即 latch 新 packet。
+ *   因此 `req_instr` 必须在 `packet_in.valid==1` 的整个周期保持为 0，避免 issue 连发导致丢包。
+ * - `mem_rpl.release_lock` 与 `mem_grant` 同拍拉高，完成访存当拍释放资源。
+ */
+
 `include "structs.svh"
 
 module sic_exec_mem #(
@@ -22,122 +40,84 @@ module sic_exec_mem #(
     assign mem_rdata = in.mem_rdata;
     assign mem_grant = in.mem_grant;
 
-    // 状态机
-    typedef enum logic [3:0] {
-        WAIT_PACKET,
-        REQUEST_LOCKS,
-        MEM_ACCESS
-    } state_t;
+    // “ready-bit”风格：用少量寄存器描述执行进度
+    logic               busy;  // 已锁存 pkt，指令在飞
+    logic               mem_wait;  // 已进入访存阶段，等待 mem_grant
+    sic_packet_t        pkt;
 
-    state_t state;
-    sic_packet_t pkt;
-
-    logic [31:0] mem_addr_hold;  // byte addr
-    logic [31:0] mem_wdata_hold;
+    logic        [31:0] mem_addr_hold;  // byte addr
+    logic        [31:0] mem_wdata_hold;
 
     // Abort：依赖的 ECR 为 10 时，丢弃当前指令
-    logic abort_mispredict;
+    logic               abort_mispredict;
 
-    // 指令资源需求（用于请求/释放资源）
-    logic need_reg_read0, need_reg_read1, need_reg_write2;
-    logic need_mem_read, need_mem_write;
-
-    // REQUEST_LOCKS 阶段的 grant 聚合
-    logic all_granted;
-    sic_packet_t pkt_v;
+    logic               rf_ok;
+    logic               ecr_ok;
 
     // 组合逻辑计算锁请求
     always_comb begin
-        out                      = '0;
+        out = '0;
 
-        // WAIT_PACKET 拍使用 packet_in 视图，其余拍使用已锁存的 pkt
-        pkt_v                    = ((state == WAIT_PACKET) && packet_in.valid) ? packet_in : pkt;
-
-        // 资源需求（由 decoder 给出）
-        need_reg_read0           = pkt_v.info.read_rs;
-        need_reg_read1           = pkt_v.info.read_rt;
-        need_reg_write2          = pkt_v.info.write_gpr;
-        need_mem_read            = pkt_v.info.mem_read;
-        need_mem_write           = pkt_v.info.mem_write;
+        // ready 条件（组合）
+        rf_ok = (!pkt.info.read_rs || reg_ans.rs_valid) && (!pkt.info.read_rt || reg_ans.rt_valid);
+        ecr_ok = (!pkt.dep_ecr_id[1]) || (in.ecr_read_data == 2'b01);
 
         // ECR read: dep_ecr_id 编码为 {valid,id}
-        out.ecr_read_addr        = pkt.dep_ecr_id[0];
-        out.ecr_read_en          = (state != WAIT_PACKET) && pkt.dep_ecr_id[1];
-        abort_mispredict         = out.ecr_read_en && (in.ecr_read_data == 2'b10);
+        out.ecr_read_addr = pkt.dep_ecr_id[0];
+        out.ecr_read_en = busy && pkt.dep_ecr_id[1];
+        abort_mispredict = out.ecr_read_en && (in.ecr_read_data == 2'b10);
 
-        // req instr
-        out.req_instr            = (state == WAIT_PACKET && !packet_in.valid);
+        // req instr：必须把 packet_in.valid 也考虑进去，避免 issue 连发导致丢包
+        out.req_instr = !busy && !packet_in.valid;
 
         // mem lock & request
         out.mem_rpl.req_issue_id = pkt.issue_id;
-        if (state == MEM_ACCESS) begin
-            out.mem_rpl.req          = (need_mem_read || need_mem_write);
-            out.mem_rpl.release_lock = mem_grant;
-        end
+        out.mem_rpl.req = mem_wait && !abort_mispredict;
+        out.mem_rpl.release_lock = mem_wait && mem_grant;
+
         out.mem_req.addr = mem_addr_hold[31:2];
         out.mem_req.wdata = mem_wdata_hold;
-        out.mem_req.wen = (state == MEM_ACCESS) && need_mem_write && mem_grant && !abort_mispredict;
+        out.mem_req.wen = mem_wait && mem_grant && pkt.info.mem_write && !abort_mispredict;
 
         // RF commit (LW only)
         out.reg_req = '0;
-        if ((state == MEM_ACCESS) && need_mem_read && mem_grant) begin
-            out.reg_req.wdata   = mem_rdata;
-            out.reg_req.wcommit = need_reg_write2 && !abort_mispredict;
-        end
-    end
-
-    // 聚合 grant（避免在 always_ff 内部声明 all_granted 变量）
-    always_comb begin
-        all_granted = 1;
-        if (state == REQUEST_LOCKS) begin
-            if (need_reg_read0 && !reg_ans.rs_valid) all_granted = 0;
-            if (need_reg_read1 && !reg_ans.rt_valid) all_granted = 0;
-        end
+        out.reg_req.wdata = mem_rdata;
+        out.reg_req.wcommit = mem_wait && mem_grant && pkt.info.mem_read && pkt.info.write_gpr &&
+                              !abort_mispredict;
     end
 
     // 状态机逻辑
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= WAIT_PACKET;
+            busy <= 1'b0;
+            mem_wait <= 1'b0;
+            pkt <= '0;
             mem_addr_hold <= 32'b0;
             mem_wdata_hold <= 32'b0;
         end else begin
-            // 若依赖 ECR 已为 Incorrect，则丢弃当前指令
-            if (abort_mispredict) begin
-                state <= WAIT_PACKET;
-            end else
-                case (state)
-                    WAIT_PACKET: begin
-                        if (packet_in.valid) begin
-                            pkt   <= packet_in;
-                            state <= REQUEST_LOCKS;
-                        end
+            if (!busy) begin
+                if (packet_in.valid) begin
+                    pkt <= packet_in;
+                    busy <= 1'b1;
+                    mem_wait <= 1'b0;
+                end
+            end else begin
+                if (abort_mispredict) begin
+                    busy <= 1'b0;
+                    mem_wait <= 1'b0;
+                end else if (!mem_wait) begin
+                    if (rf_ok && ecr_ok) begin
+                        mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
+                        mem_wdata_hold <= reg_ans.rt_rdata;
+                        mem_wait <= 1'b1;
                     end
-
-                    REQUEST_LOCKS: begin
-                        // 等待所需资源满足
-                        // 约定：00=Busy, 01=Correct, 10=Incorrect
-                        if (all_granted) begin
-                            if (!pkt.dep_ecr_id[1] || (in.ecr_read_data == 2'b01)) begin
-                                // 地址计算（内部加法）
-                                mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
-                                mem_wdata_hold <= reg_ans.rt_rdata;
-                                state <= MEM_ACCESS;
-                            end
-                            // dep_valid==1 且 ecr==00：保持等待
-                            // dep_valid==1 且 ecr==10：由 abort_mispredict 分支统一处理
-                        end
+                end else begin
+                    if (mem_grant) begin
+                        busy <= 1'b0;
+                        mem_wait <= 1'b0;
                     end
-
-                    MEM_ACCESS: begin
-                        // lw/sw：等待 mem grant；grant 当拍完成访存
-                        if (mem_grant) begin
-                            state <= WAIT_PACKET;
-                        end else begin
-                            state <= MEM_ACCESS;
-                        end
-                    end
-                endcase
+                end
+            end
         end
     end
 
