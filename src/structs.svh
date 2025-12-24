@@ -252,4 +252,54 @@ typedef enum logic [1:0] {
     PR_READING      // referenced and value valid
 } pr_state_t;
 
+// -----------------------------
+// Sub-SIC bundled interfaces (internal use)
+// -----------------------------
+class sic_sub_in #(
+    parameter int NUM_PHY_REGS = 64,
+    parameter int ID_WIDTH     = 16
+);
+    typedef struct packed {
+        sic_packet_t pkt;
+        reg_ans_t    reg_ans;
+        logic [31:0] mem_rdata;
+        logic        mem_grant;
+        alu_ans_t    alu_ans;
+        logic        alu_grant;
+        logic [1:0]  ecr_read_data;
+    } t;
+endclass
+
+class sic_sub_out #(
+    parameter int NUM_PHY_REGS = 64,
+    parameter int ID_WIDTH     = 16
+);
+    typedef struct packed {
+        logic req_instr;
+
+        // RF
+        $unit::reg_req#(NUM_PHY_REGS)::t reg_req;
+
+        // MEM
+        rpl_req#(ID_WIDTH)::t mem_rpl;
+        mem_req_t mem_req;
+
+        // ALU
+        rpl_req#(ID_WIDTH)::t alu_rpl;
+        alu_req_t             alu_req;
+
+        // // ECR
+        logic                 ecr_read_en;
+        logic [$clog2(2)-1:0] ecr_read_addr;
+        logic                 ecr_wen;
+        logic [$clog2(2)-1:0] ecr_write_addr;
+        logic [          1:0] ecr_wdata;
+
+        // // JR redirect
+        logic                pc_redirect_valid;
+        logic [        31:0] pc_redirect_pc;
+        logic [ID_WIDTH-1:0] pc_redirect_issue_id;
+    } t;
+endclass
+
 `endif
