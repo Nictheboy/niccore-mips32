@@ -28,7 +28,6 @@ module sic_exec_simple #(
         WAIT_PACKET,
         REQUEST_LOCKS,
         EXECUTE_READ,
-        CHECK_ECR,
         COMMIT_WRITE
     } state_t;
 
@@ -125,11 +124,6 @@ module sic_exec_simple #(
                         if (pkt.info.cf_kind == CF_JUMP_REG) begin
                             jr_target_r <= reg_ans.rs_rdata;
                         end
-                        // 单周期进入下一阶段
-                        state <= CHECK_ECR;
-                    end
-
-                    CHECK_ECR: begin
                         // 约定：00=Busy, 01=Correct, 10=Incorrect
                         if (!pkt.dep_ecr_id[1]) begin
                             unique case (pkt.info.wb_sel)
@@ -148,8 +142,10 @@ module sic_exec_simple #(
                                 default: reg_wdata_dst <= reg_wdata_dst;
                             endcase
                             state <= COMMIT_WRITE;
+                        end else begin
+                            // 00: Busy，保持等待（不额外消耗 CHECK_ECR 周期）
+                            state <= EXECUTE_READ;
                         end
-                        // 00: Busy，保持等待
                     end
 
                     COMMIT_WRITE: begin

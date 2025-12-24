@@ -27,7 +27,6 @@ module sic_exec_mem #(
         WAIT_PACKET,
         REQUEST_LOCKS,
         EXECUTE_READ,
-        CHECK_ECR,
         MEM_ACCESS
     } state_t;
 
@@ -128,11 +127,6 @@ module sic_exec_mem #(
                             mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
                             mem_wdata_hold <= reg_ans.rt_rdata;
                         end
-                        // 单周期进入下一阶段
-                        state <= CHECK_ECR;
-                    end
-
-                    CHECK_ECR: begin
                         // 约定：00=Busy, 01=Correct, 10=Incorrect
                         if (!pkt.dep_ecr_id[1]) begin
                             state <= MEM_ACCESS;
@@ -140,8 +134,10 @@ module sic_exec_mem #(
                             state <= WAIT_PACKET;
                         end else if (in.ecr_read_data == 2'b01) begin
                             state <= MEM_ACCESS;
+                        end else begin
+                            // 00: Busy，保持等待（不额外消耗 CHECK_ECR 周期）
+                            state <= EXECUTE_READ;
                         end
-                        // 00: Busy，保持等待
                     end
 
                     MEM_ACCESS: begin
