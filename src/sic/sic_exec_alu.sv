@@ -24,13 +24,11 @@ module sic_exec_alu #(
 
     // 状态机
     typedef enum logic [3:0] {
-        IDLE,
         WAIT_PACKET,
         REQUEST_LOCKS,
         EXECUTE_READ,
         CHECK_ECR,
-        COMMIT_WRITE,
-        RELEASE
+        COMMIT_WRITE
     } state_t;
 
     state_t state;
@@ -69,13 +67,13 @@ module sic_exec_alu #(
         need_reg_write2          = pkt_v.info.write_gpr;
         need_alu                 = pkt_v.info.use_alu;
 
-        // ECR read
-        out.ecr_read_addr        = pkt.dep_ecr_id[$clog2(2)-1:0];
-        out.ecr_read_en          = (state != IDLE) && (state != WAIT_PACKET);
+        // ECR read: dep_ecr_id 编码为 {valid,id}
+        out.ecr_read_addr        = pkt.dep_ecr_id[0];
+        out.ecr_read_en          = (state != WAIT_PACKET) && pkt.dep_ecr_id[1];
         abort_mispredict         = out.ecr_read_en && (in.ecr_read_data == 2'b10);
 
         // req instr
-        out.req_instr            = (state == IDLE) || (state == WAIT_PACKET && !packet_in.valid);
+        out.req_instr            = (state == WAIT_PACKET && !packet_in.valid);
 
         // ALU lock + request
         out.alu_rpl.req_issue_id = pkt.issue_id;
@@ -86,7 +84,7 @@ module sic_exec_alu #(
         out.alu_req = alu_req;
 
         // 外部资源请求策略：
-        // - ALU：持有直到 RELEASE
+        // - ALU：持有直到提交（COMMIT_WRITE）/丢弃（abort）
         // RF commit (WB_ALU only; addresses are driven by top-level)
         out.reg_req = '0;
         out.reg_req.wdata = reg_wdata_dst;
@@ -113,7 +111,7 @@ module sic_exec_alu #(
     // 状态机逻辑
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= IDLE;
+            state <= WAIT_PACKET;
             alu_release_pulse <= 0;
             ecr_wen <= 0;
             reg_wdata_dst <= 32'b0;
@@ -125,13 +123,10 @@ module sic_exec_alu #(
 
             // 若依赖 ECR 已为 Incorrect，则丢弃当前指令
             if (abort_mispredict) begin
-                state <= RELEASE;
+                if (need_alu) alu_release_pulse <= 1;
+                state <= WAIT_PACKET;
             end else
                 case (state)
-                    IDLE: begin
-                        state <= WAIT_PACKET;
-                    end
-
                     WAIT_PACKET: begin
                         if (packet_in.valid) begin
                             pkt   <= packet_in;
@@ -160,8 +155,13 @@ module sic_exec_alu #(
 
                     CHECK_ECR: begin
                         // 约定：00=Busy, 01=Correct, 10=Incorrect
-                        if (in.ecr_read_data == 2'b10) begin
-                            state <= RELEASE;
+                        if (!pkt.dep_ecr_id[1]) begin
+                            reg_wdata_dst <= in.alu_ans.c;
+                            zero_val      <= in.alu_ans.zero;
+                            state         <= COMMIT_WRITE;
+                        end else if (in.ecr_read_data == 2'b10) begin
+                            if (need_alu) alu_release_pulse <= 1;
+                            state <= WAIT_PACKET;
                         end else if (in.ecr_read_data == 2'b01) begin
                             reg_wdata_dst <= in.alu_ans.c;
                             zero_val      <= in.alu_ans.zero;
@@ -180,14 +180,8 @@ module sic_exec_alu #(
                             ecr_wdata <= (zero_val == pkt.pred_taken) ? 2'b01 : 2'b10;
                         end
 
-                        // 下一状态释放
-                        state <= RELEASE;
-                    end
-
-                    RELEASE: begin
-                        // 释放资源
                         if (need_alu) alu_release_pulse <= 1;
-                        state <= IDLE;
+                        state <= WAIT_PACKET;
                     end
                 endcase
         end

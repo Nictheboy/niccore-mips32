@@ -25,13 +25,11 @@ module sic_exec_simple #(
 
     // 状态机
     typedef enum logic [3:0] {
-        IDLE,
         WAIT_PACKET,
         REQUEST_LOCKS,
         EXECUTE_READ,
         CHECK_ECR,
-        COMMIT_WRITE,
-        RELEASE
+        COMMIT_WRITE
     } state_t;
 
     state_t state;
@@ -64,13 +62,13 @@ module sic_exec_simple #(
         need_reg_read1    = pkt_v.info.read_rt;
         need_reg_write2   = pkt_v.info.write_gpr;
 
-        // ECR read
-        out.ecr_read_addr = pkt.dep_ecr_id[$clog2(2)-1:0];
-        out.ecr_read_en   = (state != IDLE) && (state != WAIT_PACKET);
+        // ECR read: dep_ecr_id 编码为 {valid,id}
+        out.ecr_read_addr = pkt.dep_ecr_id[0];
+        out.ecr_read_en   = (state != WAIT_PACKET) && pkt.dep_ecr_id[1];
         abort_mispredict  = out.ecr_read_en && (in.ecr_read_data == 2'b10);
 
         // req instr
-        out.req_instr     = (state == IDLE) || (state == WAIT_PACKET && !packet_in.valid);
+        out.req_instr     = (state == WAIT_PACKET && !packet_in.valid);
 
         // RF commit (WB_LUI/WB_LINK only; addresses are driven by top-level)
         out.reg_req       = '0;
@@ -97,7 +95,7 @@ module sic_exec_simple #(
     // 状态机逻辑
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= IDLE;
+            state <= WAIT_PACKET;
             reg_wdata_dst <= 32'b0;
             jr_target_r <= 32'b0;
             pc_redirect_valid <= 1'b0;
@@ -108,13 +106,9 @@ module sic_exec_simple #(
 
             // 若依赖 ECR 已为 Incorrect，则丢弃当前指令
             if (abort_mispredict) begin
-                state <= RELEASE;
+                state <= WAIT_PACKET;
             end else
                 case (state)
-                    IDLE: begin
-                        state <= WAIT_PACKET;
-                    end
-
                     WAIT_PACKET: begin
                         if (packet_in.valid) begin
                             pkt   <= packet_in;
@@ -137,8 +131,15 @@ module sic_exec_simple #(
 
                     CHECK_ECR: begin
                         // 约定：00=Busy, 01=Correct, 10=Incorrect
-                        if (in.ecr_read_data == 2'b10) begin
-                            state <= RELEASE;
+                        if (!pkt.dep_ecr_id[1]) begin
+                            unique case (pkt.info.wb_sel)
+                                WB_LUI:  reg_wdata_dst <= {pkt.info.imm16, 16'b0};
+                                WB_LINK: reg_wdata_dst <= pkt.pc + 32'd4;
+                                default: reg_wdata_dst <= reg_wdata_dst;
+                            endcase
+                            state <= COMMIT_WRITE;
+                        end else if (in.ecr_read_data == 2'b10) begin
+                            state <= WAIT_PACKET;
                         end else if (in.ecr_read_data == 2'b01) begin
                             // 准备写回数据
                             unique case (pkt.info.wb_sel)
@@ -170,13 +171,7 @@ module sic_exec_simple #(
 `endif
                         end
 
-                        // 下一状态释放
-                        state <= RELEASE;
-                    end
-
-                    RELEASE: begin
-                        // 释放资源
-                        state <= IDLE;
+                        state <= WAIT_PACKET;
                     end
                 endcase
         end

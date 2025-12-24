@@ -24,13 +24,11 @@ module sic_exec_mem #(
 
     // 状态机
     typedef enum logic [3:0] {
-        IDLE,
         WAIT_PACKET,
         REQUEST_LOCKS,
         EXECUTE_READ,
         CHECK_ECR,
-        MEM_ACCESS,
-        RELEASE
+        MEM_ACCESS
     } state_t;
 
     state_t state;
@@ -64,13 +62,13 @@ module sic_exec_mem #(
         need_mem_read            = pkt_v.info.mem_read;
         need_mem_write           = pkt_v.info.mem_write;
 
-        // ECR read
-        out.ecr_read_addr        = pkt.dep_ecr_id[$clog2(2)-1:0];
-        out.ecr_read_en          = (state != IDLE) && (state != WAIT_PACKET);
+        // ECR read: dep_ecr_id 编码为 {valid,id}
+        out.ecr_read_addr        = pkt.dep_ecr_id[0];
+        out.ecr_read_en          = (state != WAIT_PACKET) && pkt.dep_ecr_id[1];
         abort_mispredict         = out.ecr_read_en && (in.ecr_read_data == 2'b10);
 
         // req instr
-        out.req_instr            = (state == IDLE) || (state == WAIT_PACKET && !packet_in.valid);
+        out.req_instr            = (state == WAIT_PACKET && !packet_in.valid);
 
         // mem lock & request
         out.mem_rpl.req_issue_id = pkt.issue_id;
@@ -102,19 +100,15 @@ module sic_exec_mem #(
     // 状态机逻辑
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= IDLE;
+            state <= WAIT_PACKET;
             mem_addr_hold <= 32'b0;
             mem_wdata_hold <= 32'b0;
         end else begin
             // 若依赖 ECR 已为 Incorrect，则丢弃当前指令
             if (abort_mispredict) begin
-                state <= RELEASE;
+                state <= WAIT_PACKET;
             end else
                 case (state)
-                    IDLE: begin
-                        state <= WAIT_PACKET;
-                    end
-
                     WAIT_PACKET: begin
                         if (packet_in.valid) begin
                             pkt   <= packet_in;
@@ -140,8 +134,10 @@ module sic_exec_mem #(
 
                     CHECK_ECR: begin
                         // 约定：00=Busy, 01=Correct, 10=Incorrect
-                        if (in.ecr_read_data == 2'b10) begin
-                            state <= RELEASE;
+                        if (!pkt.dep_ecr_id[1]) begin
+                            state <= MEM_ACCESS;
+                        end else if (in.ecr_read_data == 2'b10) begin
+                            state <= WAIT_PACKET;
                         end else if (in.ecr_read_data == 2'b01) begin
                             state <= MEM_ACCESS;
                         end
@@ -151,15 +147,10 @@ module sic_exec_mem #(
                     MEM_ACCESS: begin
                         // lw/sw：等待 mem grant；grant 当拍完成访存
                         if (mem_grant) begin
-                            state <= RELEASE;
+                            state <= WAIT_PACKET;
                         end else begin
                             state <= MEM_ACCESS;
                         end
-                    end
-
-                    RELEASE: begin
-                        // 释放资源
-                        state <= IDLE;
                     end
                 endcase
         end
