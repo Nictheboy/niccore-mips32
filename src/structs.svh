@@ -113,31 +113,38 @@ typedef struct packed {
 // -----------------------------
 // SIC packet (issue -> execute)
 // -----------------------------
-typedef struct packed {
-    logic        valid;         // 指令有效位
-    logic [31:0] pc;            // 当前指令 PC
-    logic [31:0] next_pc_pred;  // 预测的下一条 PC (用于 JAL/Branch)
+class sic_packet #(
+    parameter int NUM_PHY_REGS,
+    parameter int ID_WIDTH,
+    parameter int NUM_ECRS
+);
+    localparam int PR_W  = (NUM_PHY_REGS > 1) ? $clog2(NUM_PHY_REGS) : 1;
+    localparam int ECR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
 
-    // 锁与排序
-    logic [15:0] issue_id;  // 发射序号 (假设 16位宽)
+    typedef struct packed {
+        logic        valid;         // 指令有效位
+        logic [31:0] pc;            // 当前指令 PC
+        logic [31:0] next_pc_pred;  // 预测的下一条 PC (用于 JAL/Branch)
 
-    // 解码信息
-    instr_info_t info;
+        // 锁与排序
+        logic [ID_WIDTH-1:0] issue_id;
 
-    // 寄存器重命名结果 (物理寄存器号)
-    // 说明：
-    // - phy_rs/phy_rt/phy_rd：对应“逻辑字段 rs/rt/rd”的物理映射（仅用于执行/调试）
-    // - phy_dst：本指令真正要写回的目的物理寄存器（SIC 写端口使用它）
-    logic [5:0] phy_rs;   // rs 字段映射；无意义则为 'x
-    logic [5:0] phy_rt;   // rt 字段映射；无意义则为 'x
-    logic [5:0] phy_rd;   // rd 字段映射；无意义则为 'x
-    logic [5:0] phy_dst;  // 目的寄存器映射；无写回则为 'x
+        // 解码信息
+        instr_info_t info;
 
-    // 分支预测与 ECR
-    logic       pred_taken;  // 预测跳转方向
-    logic [1:0] dep_ecr_id;  // 依赖的 ECR 号
-    logic [1:0] set_ecr_id;  // 本指令需要设置的 ECR 号
-} sic_packet_t;
+        // 寄存器重命名结果 (物理寄存器号)
+        logic [PR_W-1:0] phy_rs;
+        logic [PR_W-1:0] phy_rt;
+        logic [PR_W-1:0] phy_rd;
+        logic [PR_W-1:0] phy_dst;
+
+        // 分支预测与 ECR
+        logic          pred_taken;
+        // dep/set_ecr_id 编码为 {valid, id}
+        logic [ECR_W:0] dep_ecr_id;
+        logic [ECR_W:0] set_ecr_id;
+    } t;
+endclass
 
 // -----------------------------
 // Data memory request bundle (to data_memory)
@@ -256,11 +263,12 @@ typedef enum logic [1:0] {
 // Sub-SIC bundled interfaces (internal use)
 // -----------------------------
 class sic_sub_in #(
-    parameter int NUM_PHY_REGS = 64,
-    parameter int ID_WIDTH     = 16
+    parameter int NUM_PHY_REGS,
+    parameter int ID_WIDTH,
+    parameter int NUM_ECRS
 );
     typedef struct packed {
-        sic_packet_t pkt;
+        sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t pkt;
         reg_ans_t    reg_ans;
         logic [31:0] mem_rdata;
         logic        mem_grant;
@@ -271,9 +279,11 @@ class sic_sub_in #(
 endclass
 
 class sic_sub_out #(
-    parameter int NUM_PHY_REGS = 64,
-    parameter int ID_WIDTH     = 16
+    parameter int NUM_PHY_REGS,
+    parameter int ID_WIDTH,
+    parameter int NUM_ECRS
 );
+    localparam int ECR_AW = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
     typedef struct packed {
         logic req_instr;
 
@@ -290,9 +300,9 @@ class sic_sub_out #(
 
         // // ECR
         logic                 ecr_read_en;
-        logic [$clog2(2)-1:0] ecr_read_addr;
+        logic [ECR_AW-1:0] ecr_read_addr;
         logic                 ecr_wen;
-        logic [$clog2(2)-1:0] ecr_write_addr;
+        logic [ECR_AW-1:0] ecr_write_addr;
         logic [          1:0] ecr_wdata;
 
         // // JR redirect

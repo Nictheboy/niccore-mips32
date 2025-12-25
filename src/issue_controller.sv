@@ -7,6 +7,7 @@
 module issue_controller #(
     parameter int NUM_SICS,
     parameter int NUM_PHY_REGS,
+    parameter int NUM_ECRS,
     parameter int ID_WIDTH,
     parameter int BRANCH_PREDICTOR_TABLE_SIZE
 ) (
@@ -19,7 +20,7 @@ module issue_controller #(
 
     // SIC 交互接口
     input  logic                       sic_req_instr           [NUM_SICS],
-    output sic_packet_t                sic_packet_out          [NUM_SICS],
+    output sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packet_out[NUM_SICS],
     input  logic                       sic_pc_redirect_valid   [NUM_SICS],
     input  logic        [        31:0] sic_pc_redirect_pc      [NUM_SICS],
     input  logic        [ID_WIDTH-1:0] sic_pc_redirect_issue_id[NUM_SICS],
@@ -36,18 +37,17 @@ module issue_controller #(
     input logic [NUM_PHY_REGS-1:0] pr_not_idle,
 
     // ECR -> Issue：汇总状态（allocator + rollback + in_use）
-    input ecr_status_for_issue#(2)::t ecr_status,
+    input ecr_status_for_issue#(NUM_ECRS)::t ecr_status,
     // ECR monitor：提供每个 ECR 的 2-bit 状态（00/01/10），用于管理快照生命周期
-    input logic [1:0] ecr_monitor[2],
+    input logic [1:0] ecr_monitor[NUM_ECRS],
 
     // Issue -> ECR：统一更新（reset + bpinfo + altpc）
-    output ecr_reset_for_issue#(2)::t ecr_update,
+    output ecr_reset_for_issue#(NUM_ECRS)::t ecr_update,
 
     // ECR -> BP：由 ECR 产生更新，issue_controller 仅转接
     input bp_update_t bp_update
 );
 
-    localparam int NUM_ECRS = 2;
     localparam int ECR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
     localparam int PR_W = (NUM_PHY_REGS > 1) ? $clog2(NUM_PHY_REGS) : 1;
 
@@ -60,7 +60,7 @@ module issue_controller #(
     logic [ID_WIDTH-1:0] jr_wait_issue_id;
 
     // 当前依赖链 ECR（写入 packet.dep_ecr_id）
-    logic [1:0] active_ecr;
+    logic [ECR_W:0] active_ecr;
 
     // 逻辑寄存器映射表（RAT）：只跟踪 1..31，$0 恒为 PR0
     typedef struct {logic [PR_W-1:0] rat[31:1];} rename_state_t;
@@ -71,7 +71,7 @@ module issue_controller #(
     rename_state_t       ckpt_state       [NUM_ECRS];
     logic                ckpt_valid       [NUM_ECRS];
     // parent 指针：记录该检查点创建前的依赖链，用于回滚时恢复 active_ecr
-    logic          [1:0] ckpt_parent      [NUM_ECRS];
+    logic [ECR_W:0] ckpt_parent      [NUM_ECRS];
     logic                ckpt_parent_valid[NUM_ECRS];
     // 本地保留位：用于避免同一拍/相邻拍对同一 ECR 误分配
     logic                ecr_pending_busy [NUM_ECRS];
@@ -144,7 +144,7 @@ module issue_controller #(
             global_issue_id <= '0;
             jr_waiting <= 1'b0;
             jr_wait_issue_id <= '0;
-            active_ecr <= 2'b00;
+            active_ecr <= '0;
             ecr_update <= '0;
             // 初始化 RAT：lr[i] -> pr[i] (exclude $0)
             for (int i = 1; i < 32; i++) begin
@@ -152,7 +152,7 @@ module issue_controller #(
             end
             for (int e = 0; e < NUM_ECRS; e++) begin
                 ckpt_valid[e] <= 1'b0;
-                ckpt_parent[e] <= 2'b00;
+                ckpt_parent[e] <= '0;
                 ckpt_parent_valid[e] <= 1'b0;
                 ecr_pending_busy[e] <= 1'b0;
                 ckpt_seen_nonfree[e] <= 1'b0;
@@ -199,7 +199,7 @@ module issue_controller #(
             // 2) 回滚：由 ECR 发起（任一 ECR==10）
             if (ecr_status.rollback_valid) begin
                 int rid;
-                logic [1:0] rid_bits;
+                logic [ECR_W:0] rid_bits;
                 rid = ecr_status.rollback_id;
                 pc <= ecr_status.rollback_target_pc;
                 // 恢复检查点（若不存在则不改 RAT）
@@ -230,7 +230,7 @@ module issue_controller #(
                 ecr_update.reset_data <= 2'b01;
                 // 恢复依赖链到 parent（未知则置 00）
                 if (ckpt_parent_valid[rid]) active_ecr <= ckpt_parent[rid];
-                else active_ecr <= 2'b00;
+                else active_ecr <= '0;
             end else if (jr_waiting) begin
                 // 3) JR 等待：暂停发射直到重定向到来
                 logic got;
@@ -258,7 +258,7 @@ module issue_controller #(
 
                 rename_state_t st_work;
                 logic [NUM_PHY_REGS-1:0] used_work;
-                logic [1:0] active_ecr_work;
+                logic [ECR_W:0] active_ecr_work;
 
                 issued = 0;
                 next_pc = pc;

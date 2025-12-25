@@ -13,13 +13,17 @@
 module sic_exec_jr #(
     parameter int SIC_ID,
     parameter int NUM_PHY_REGS,
+    parameter int NUM_ECRS,
     parameter int ID_WIDTH
 ) (
     input logic clk,
     input logic rst_n,
-    input sic_sub_in#(NUM_PHY_REGS, ID_WIDTH)::t in,
-    output sic_sub_out#(NUM_PHY_REGS, ID_WIDTH)::t out
+    input sic_sub_in#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t in,
+    output sic_sub_out#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t out
 );
+
+    localparam int ECR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
+    typedef sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packet_t;
 
     sic_packet_t packet_in;
     reg_ans_t    reg_ans;
@@ -39,10 +43,10 @@ module sic_exec_jr #(
         out                      = '0;
 
         rf_ok                    = (!pkt.info.read_rs) || reg_ans.rs_valid;
-        ecr_ok                   = (!pkt.dep_ecr_id[1]) || (in.ecr_read_data == 2'b01);
+        ecr_ok                   = (!pkt.dep_ecr_id[ECR_W]) || (in.ecr_read_data == 2'b01);
 
-        out.ecr_read_addr        = pkt.dep_ecr_id[0];
-        out.ecr_read_en          = busy && pkt.dep_ecr_id[1];
+        out.ecr_read_addr        = pkt.dep_ecr_id[ECR_W-1:0];
+        out.ecr_read_en          = busy && pkt.dep_ecr_id[ECR_W];
         abort_mispredict         = out.ecr_read_en && (in.ecr_read_data == 2'b10);
 
         out.req_instr            = !busy && !packet_in.valid;

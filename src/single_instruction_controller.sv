@@ -4,6 +4,7 @@
 module single_instruction_controller #(
     parameter int SIC_ID,
     parameter int NUM_PHY_REGS,
+    parameter int NUM_ECRS,
     parameter int ID_WIDTH
 ) (
     input logic clk,
@@ -11,7 +12,7 @@ module single_instruction_controller #(
 
     // 与 Issue Controller 交互
     output logic        req_instr,
-    input  sic_packet_t packet_in,
+    input  sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t packet_in,
 
     // 与 Register File 交互（打包接口）
     output reg_req#(NUM_PHY_REGS)::t reg_req,
@@ -32,11 +33,11 @@ module single_instruction_controller #(
     // 与 ECR 交互 (简化接口)
     // 读接口：直接输出地址，组合逻辑读取
     output logic                 ecr_read_en,
-    output logic [$clog2(2)-1:0] ecr_read_addr,   // 假设 NUM_ECRS=2
+    output logic [((NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1)-1:0] ecr_read_addr,
     input  logic [          1:0] ecr_read_data,
     // 写接口：写使能和地址数据
     output logic                 ecr_wen,
-    output logic [$clog2(2)-1:0] ecr_write_addr,
+    output logic [((NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1)-1:0] ecr_write_addr,
     output logic [          1:0] ecr_wdata,
 
     // === JR：提交后 PC 重定向反馈 ===
@@ -44,6 +45,8 @@ module single_instruction_controller #(
     output logic [        31:0] pc_redirect_pc,
     output logic [ID_WIDTH-1:0] pc_redirect_issue_id
 );
+
+    typedef sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packet_t;
 
     // 选择子 SIC：接收 packet 的当拍用组合选择，后续用寄存选择保持稳定
     typedef enum logic [2:0] {
@@ -90,9 +93,9 @@ module single_instruction_controller #(
     end
 
     // 子 SIC bundle
-    sic_sub_in #(NUM_PHY_REGS, ID_WIDTH)::t in_alu, in_mem, in_imm, in_jr, in_syscall;
-    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH)::t out_alu, out_mem, out_imm, out_jr, out_syscall;
-    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH)::t out_sel;
+    sic_sub_in #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t in_alu, in_mem, in_imm, in_jr, in_syscall;
+    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t out_alu, out_mem, out_imm, out_jr, out_syscall;
+    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t out_sel;
 
     // 保存最近一次接收到的 packet（用于 PR 占用声明在后续周期持续有效）
     sic_packet_t pkt_hold;
@@ -150,6 +153,7 @@ module single_instruction_controller #(
     sic_exec_alu #(
         .SIC_ID(SIC_ID),
         .NUM_PHY_REGS(NUM_PHY_REGS),
+        .NUM_ECRS(NUM_ECRS),
         .ID_WIDTH(ID_WIDTH)
     ) u_alu (
         .clk(clk),
@@ -161,6 +165,7 @@ module single_instruction_controller #(
     sic_exec_mem #(
         .SIC_ID(SIC_ID),
         .NUM_PHY_REGS(NUM_PHY_REGS),
+        .NUM_ECRS(NUM_ECRS),
         .ID_WIDTH(ID_WIDTH)
     ) u_mem (
         .clk(clk),
@@ -172,6 +177,7 @@ module single_instruction_controller #(
     sic_exec_imm #(
         .SIC_ID(SIC_ID),
         .NUM_PHY_REGS(NUM_PHY_REGS),
+        .NUM_ECRS(NUM_ECRS),
         .ID_WIDTH(ID_WIDTH)
     ) u_imm (
         .clk(clk),
@@ -183,6 +189,7 @@ module single_instruction_controller #(
     sic_exec_jr #(
         .SIC_ID(SIC_ID),
         .NUM_PHY_REGS(NUM_PHY_REGS),
+        .NUM_ECRS(NUM_ECRS),
         .ID_WIDTH(ID_WIDTH)
     ) u_jr (
         .clk(clk),
@@ -194,6 +201,7 @@ module single_instruction_controller #(
     sic_exec_syscall #(
         .SIC_ID(SIC_ID),
         .NUM_PHY_REGS(NUM_PHY_REGS),
+        .NUM_ECRS(NUM_ECRS),
         .ID_WIDTH(ID_WIDTH)
     ) u_syscall (
         .clk(clk),
@@ -256,7 +264,7 @@ module single_instruction_controller #(
             sel_r <= SEL_IMM;
             pkt_hold <= '0;
         end else begin
-            if (packet_in.valid) begin
+                        if (packet_in.valid) begin
                 sel_r <= sel_now;
                 pkt_hold <= packet_in;
             end else if (req_instr) begin

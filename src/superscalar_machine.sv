@@ -16,6 +16,7 @@ module superscalar_machine (
     localparam int NUM_ECRS = 2;
     localparam int ID_WIDTH = 16;
     localparam int TOTAL_REG_PORTS = NUM_SICS * 3;
+    localparam int ECR_ADDR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
     localparam int BRANCH_PREDICTOR_TABLE_SIZE = 64;
     localparam int IMEM_DEPTH = 1024;
     localparam logic [31:0] IMEM_START_BYTE_ADDR = 32'h0000_3000;
@@ -29,7 +30,7 @@ module superscalar_machine (
 
     // SIC <-> Issue Controller
     logic sic_req_instr[NUM_SICS];
-    sic_packet_t sic_packets[NUM_SICS];
+    sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packets[NUM_SICS];
     // SIC -> Issue：ECR 依赖反馈
     logic sic_ecr_read_en[NUM_SICS];
     // SIC -> Issue：JR PC 重定向反馈
@@ -72,10 +73,10 @@ module superscalar_machine (
 
     // SIC <-> ECR File (Simplified Interface)
     // 注意：这里定义为 1D 数组，每个 SIC 只有一组读写信号
-    logic [$clog2(NUM_ECRS)-1:0] sic_ecr_read_addr[NUM_SICS];
+    logic [ECR_ADDR_W-1:0] sic_ecr_read_addr[NUM_SICS];
     logic [1:0] sic_ecr_read_data[NUM_SICS];  // 这是一个被驱动的 Wire
     logic sic_ecr_wen[NUM_SICS];
-    logic [$clog2(NUM_ECRS)-1:0] sic_ecr_write_addr[NUM_SICS];
+    logic [ECR_ADDR_W-1:0] sic_ecr_write_addr[NUM_SICS];
     logic [1:0] sic_ecr_wdata[NUM_SICS];
 
     // =========================================================
@@ -99,6 +100,7 @@ module superscalar_machine (
     issue_controller #(
         .NUM_SICS(NUM_SICS),
         .NUM_PHY_REGS(NUM_PHY_REGS),
+        .NUM_ECRS(NUM_ECRS),
         .ID_WIDTH(ID_WIDTH),
         .BRANCH_PREDICTOR_TABLE_SIZE(BRANCH_PREDICTOR_TABLE_SIZE)
     ) issuer (
@@ -130,6 +132,7 @@ module superscalar_machine (
             single_instruction_controller #(
                 .SIC_ID(i),
                 .NUM_PHY_REGS(NUM_PHY_REGS),
+                .NUM_ECRS(NUM_ECRS),
                 .ID_WIDTH(ID_WIDTH)
             ) sic_core (
                 .clk(clk),

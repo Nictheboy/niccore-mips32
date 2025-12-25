@@ -3,15 +3,18 @@
 module sic_exec_alu #(
     parameter int SIC_ID,
     parameter int NUM_PHY_REGS,
+    parameter int NUM_ECRS,
     parameter int ID_WIDTH
 ) (
     input logic clk,
     input logic rst_n,
-    input sic_sub_in#(NUM_PHY_REGS, ID_WIDTH)::t in,
-    output sic_sub_out#(NUM_PHY_REGS, ID_WIDTH)::t out
+    input sic_sub_in#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t in,
+    output sic_sub_out#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t out
 );
 
     // --- 本地别名：仅保留高频使用项 ---
+    localparam int ECR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
+    typedef sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packet_t;
     sic_packet_t packet_in;
     reg_ans_t    reg_ans;
 
@@ -35,11 +38,11 @@ module sic_exec_alu #(
 
         need_alu = pkt.info.use_alu;
         rf_ok = (!pkt.info.read_rs || reg_ans.rs_valid) && (!pkt.info.read_rt || reg_ans.rt_valid);
-        ecr_ok = (!pkt.dep_ecr_id[1]) || (in.ecr_read_data == 2'b01);
+        ecr_ok = (!pkt.dep_ecr_id[ECR_W]) || (in.ecr_read_data == 2'b01);
 
         // ECR read: dep_ecr_id 编码为 {valid,id}
-        out.ecr_read_addr = pkt.dep_ecr_id[0];
-        out.ecr_read_en = busy && pkt.dep_ecr_id[1];
+        out.ecr_read_addr = pkt.dep_ecr_id[ECR_W-1:0];
+        out.ecr_read_en = busy && pkt.dep_ecr_id[ECR_W];
         abort_mispredict = out.ecr_read_en && (in.ecr_read_data == 2'b10);
 
         // req instr：必须把 packet_in.valid 也考虑进去，避免 issue 连发导致丢包
@@ -67,7 +70,7 @@ module sic_exec_alu #(
 
         // ECR write (BEQ)
         out.ecr_wen = commit_now && pkt.info.write_ecr;
-        out.ecr_write_addr = pkt.set_ecr_id[$clog2(2)-1:0];
+        out.ecr_write_addr = pkt.set_ecr_id[ECR_W-1:0];
         out.ecr_wdata = (in.alu_ans.zero == pkt.pred_taken) ? 2'b01 : 2'b10;
     end
 
