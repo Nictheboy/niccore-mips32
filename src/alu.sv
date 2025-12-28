@@ -82,6 +82,9 @@ module alu (
     wire [31:0] nor_r;
     assign nor_r = ~(alu_req.a | alu_req.b);
 
+    wire [31:0] slt_r;
+    assign slt_r = ($signed(alu_req.a) < $signed(alu_req.b)) ? 32'd1 : 32'd0;
+
     assign alu_ans.c = (alu_req.op == 6'b100000) ? add_r :
                        (alu_req.op == 6'b100001) ? addu_r :
                        (alu_req.op == 6'b100010) ? sub_r :
@@ -93,6 +96,7 @@ module alu (
                        (alu_req.op == 6'b100101) ? or_r :
                        (alu_req.op == 6'b100110) ? xor_r :
                        (alu_req.op == 6'b100111) ? nor_r :
+                       (alu_req.op == 6'b101010) ? slt_r :
                        32'b0 ;
     assign alu_ans.over = (alu_req.op == 6'b100000) ? add_c : (alu_req.op == 6'b100010) ? sub_c : 0;
     assign alu_ans.zero = (alu_ans.c == 32'b0);

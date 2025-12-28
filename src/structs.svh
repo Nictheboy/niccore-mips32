@@ -28,9 +28,13 @@ typedef enum logic [5:0] {
     OPC_INVALID,
     OPC_SPECIAL,
     OPC_BEQ,
+    OPC_BNE,
     OPC_J,
     OPC_JAL,
     OPC_ORI,
+    OPC_XORI,
+    OPC_ADDIU,
+    OPC_SLTI,
     OPC_LUI,
     OPC_LW,
     OPC_SW

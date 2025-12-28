@@ -31,6 +31,7 @@ module sic_exec_alu #(
     logic        ecr_ok;
     logic        commit_now;
     logic        need_alu;
+    logic        br_taken;
 
     // 组合逻辑计算锁请求
     always_comb begin
@@ -71,7 +72,8 @@ module sic_exec_alu #(
         // ECR write (BEQ)
         out.ecr_wen = commit_now && pkt.info.write_ecr;
         out.ecr_write_addr = pkt.set_ecr_id[ECR_W-1:0];
-        out.ecr_wdata = (in.alu_ans.zero == pkt.pred_taken) ? 2'b01 : 2'b10;
+        br_taken = (pkt.info.opcode == OPC_BNE) ? ~in.alu_ans.zero : in.alu_ans.zero;
+        out.ecr_wdata = (br_taken == pkt.pred_taken) ? 2'b01 : 2'b10;
     end
 
     always_ff @(posedge clk or negedge rst_n) begin

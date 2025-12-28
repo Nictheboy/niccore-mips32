@@ -3,7 +3,7 @@
  *
  * Supported instructions:
  * - R-Type: addu, subu, jr, syscall
- * - I-Type: ori, lw, sw, beq, lui
+ * - I-Type: ori, xori, addiu, slti, lw, sw, beq, bne, lui
  * - J-Type: j, jal
  */
 
@@ -16,9 +16,13 @@ function automatic opcode_t opcode_enum(input logic [5:0] raw);
         unique case (raw)
             6'h00:   r = OPC_SPECIAL;
             6'h04:   r = OPC_BEQ;
+            6'h05:   r = OPC_BNE;
             6'h02:   r = OPC_J;
             6'h03:   r = OPC_JAL;
             6'h0d:   r = OPC_ORI;
+            6'h0e:   r = OPC_XORI;
+            6'h09:   r = OPC_ADDIU;
+            6'h0a:   r = OPC_SLTI;
             6'h0f:   r = OPC_LUI;
             6'h23:   r = OPC_LW;
             6'h2b:   r = OPC_SW;
@@ -61,24 +65,29 @@ module instruction_decoder (
 
     // I/J-Type 判定
     wire is_ori = (opc == OPC_ORI);
+    wire is_xori = (opc == OPC_XORI);
+    wire is_addiu = (opc == OPC_ADDIU);
+    wire is_slti = (opc == OPC_SLTI);
     wire is_lui = (opc == OPC_LUI);
     wire is_lw = (opc == OPC_LW);
     wire is_sw = (opc == OPC_SW);
     wire is_beq = (opc == OPC_BEQ);
+    wire is_bne = (opc == OPC_BNE);
     wire is_j = (opc == OPC_J);
     wire is_jal = (opc == OPC_JAL);
 
     wire is_alu_r = is_addu | is_subu;
+    wire is_alu_i = is_ori | is_xori | is_addiu | is_slti;
 
     // 写回选择
     wb_sel_t wb_sel_int;
 
     // 目的逻辑寄存器号（用于重命名/执行）
-    wire write_gpr_int = is_alu_r | is_ori | is_lui | is_lw | is_jal;
+    wire write_gpr_int = is_alu_r | is_alu_i | is_lui | is_lw | is_jal;
     wire [4:0] dst_lr_int =
         is_alu_r ? instr[15:11] :
         is_jal   ? 5'd31 :
-        (is_ori | is_lui | is_lw) ? instr[20:16] :
+        (is_alu_i | is_lui | is_lw) ? instr[20:16] :
         5'd0;
 
     // 目的字段类型（调试用）
@@ -86,25 +95,29 @@ module instruction_decoder (
     always_comb begin
         dst_field_int = DST_NONE;
         if (is_alu_r) dst_field_int = DST_RD;
-        else if (is_ori || is_lui || is_lw) dst_field_int = DST_RT;
+        else if (is_alu_i || is_lui || is_lw) dst_field_int = DST_RT;
     end
 
     // 源寄存器读取需求
-    wire read_rs_int = is_alu_r | is_jr | is_ori | is_lw | is_sw | is_beq;
-    wire read_rt_int = is_alu_r | is_sw | is_beq;
+    wire read_rs_int = is_alu_r | is_jr | is_alu_i | is_lw | is_sw | is_beq | is_bne;
+    wire read_rt_int = is_alu_r | is_sw | is_beq | is_bne;
 
     // 资源/执行意图
-    wire use_alu_int = is_alu_r | is_ori | is_beq;
+    wire use_alu_int = is_alu_r | is_alu_i | is_beq | is_bne;
     wire mem_read_int = is_lw;
     wire mem_write_int = is_sw;
-    wire write_ecr_int = is_beq;
+    wire write_ecr_int = is_beq | is_bne;
 
     // ALU 控制（use_alu_int=1 时有效）
-    wire [5:0] alu_op_int = is_alu_r ? func_code : is_ori ? 6'h25 :  // OR
-    is_beq ? 6'h22 :  // SUB (check zero)
+    wire [5:0] alu_op_int = is_alu_r ? func_code :
+    is_ori  ? 6'h25 :  // OR
+    is_xori ? 6'h26 :  // XOR
+    is_addiu ? 6'h21 : // ADDU (ignore overflow)
+    is_slti ? 6'h2a :  // SLT (signed)
+    (is_beq | is_bne) ? 6'h22 :  // SUB (check zero)
     6'h00;
-    wire alu_b_is_imm_int = is_ori;
-    wire alu_imm_is_zero_ext_int = is_ori;
+    wire alu_b_is_imm_int = is_alu_i;
+    wire alu_imm_is_zero_ext_int = is_ori | is_xori;
 
     // 写回来源
     always_comb begin
@@ -112,14 +125,14 @@ module instruction_decoder (
         if (is_lw) wb_sel_int = WB_MEM;
         else if (is_lui) wb_sel_int = WB_LUI;
         else if (is_jal) wb_sel_int = WB_LINK;
-        else if (is_alu_r || is_ori) wb_sel_int = WB_ALU;
+        else if (is_alu_r || is_alu_i) wb_sel_int = WB_ALU;
     end
 
     // 控制流类型
     cf_kind_t cf_kind_int;
     always_comb begin
         cf_kind_int = CF_NONE;
-        if (is_beq) cf_kind_int = CF_BRANCH;
+        if (is_beq || is_bne) cf_kind_int = CF_BRANCH;
         else if (is_j || is_jal) cf_kind_int = CF_JUMP_IMM;
         else if (is_jr) cf_kind_int = CF_JUMP_REG;
     end
