@@ -143,8 +143,8 @@ module instruction_decoder (
     // ---------------------------------------------------------
 
     assign info.opcode              = opc;
-    assign info.rs                  = instr[25:21];
-    assign info.rt                  = instr[20:16];
+    assign info.rs                  = is_syscall ? 5'd2 : instr[25:21];
+    assign info.rt                  = is_syscall ? 5'd4 : instr[20:16];
     assign info.rd                  = instr[15:11];
     assign info.funct               = instr[5:0];
     assign info.imm16               = instr[15:0];
@@ -153,8 +153,8 @@ module instruction_decoder (
     assign info.jump_target         = instr[25:0];
 
     assign info.cf_kind             = cf_kind_int;
-    assign info.read_rs             = read_rs_int;
-    assign info.read_rt             = read_rt_int;
+    assign info.read_rs             = read_rs_int | is_syscall;
+    assign info.read_rt             = read_rt_int | is_syscall;
     assign info.write_gpr           = write_gpr_int;
     assign info.dst_lr              = write_gpr_int ? dst_lr_int : 5'd0;
     assign info.dst_field           = dst_field_int;

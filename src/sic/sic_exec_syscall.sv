@@ -33,12 +33,15 @@ module sic_exec_syscall #(
 
     logic abort_mispredict;
     logic ecr_ok;
+    logic rf_ok;
     logic commit_now;
 
     always_comb begin
         out = '0;
 
         ecr_ok = (!pkt.dep_ecr_id[ECR_W]) || (in.ecr_read_data == 2'b01);
+        rf_ok = (!pkt.info.read_rs || in.reg_ans.rs_valid) &&
+                (!pkt.info.read_rt || in.reg_ans.rt_valid);
 
         out.ecr_read_addr = pkt.dep_ecr_id[ECR_W-1:0];
         out.ecr_read_en = busy && pkt.dep_ecr_id[ECR_W];
@@ -46,7 +49,7 @@ module sic_exec_syscall #(
 
         out.req_instr = !busy && !packet_in.valid;
 
-        commit_now = busy && ecr_ok && !abort_mispredict;
+        commit_now = busy && rf_ok && ecr_ok && !abort_mispredict;
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -64,8 +67,16 @@ module sic_exec_syscall #(
                     busy <= 1'b0;
                 end else if (commit_now) begin
 `ifndef SYNTHESIS
-                    $display("[SIC%0d] SYSCALL at PC=%h, finishing simulation.", SIC_ID, pkt.pc);
-                    $finish;
+                    unique case (in.reg_ans.rs_rdata)
+                        32'd1: begin
+                            $display("%0d", $signed(in.reg_ans.rt_rdata));
+                        end
+                        32'd10: begin
+                            $finish;
+                        end
+                        default: begin
+                        end
+                    endcase
 `endif
                     busy <= 1'b0;
                 end
