@@ -28,8 +28,6 @@ module issue_controller #(
     // 回滚指示（调试/监控用）
     output logic rollback_trigger,
 
-    output logic [$clog2(NUM_ECRS)-1:0] active_ecr_id,
-
     // Register File allocate
     output logic rf_alloc_wen[NUM_SICS],
     output logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr[NUM_SICS],
@@ -38,12 +36,11 @@ module issue_controller #(
     // 1 表示该 PR 正被某个 SIC 引用（rs/rt/waddr），分配器不得复用
     input logic [NUM_PHY_REGS-1:0] pr_not_idle,
 
-    // ECR -> Issue：汇总状态（allocator + rollback + in_use）
-    input ecr_status_for_issue#(NUM_ECRS)::t ecr_status,
     // ECR monitor：提供每个 ECR 的 2-bit 状态（00/01/10），用于管理快照生命周期
     input logic [1:0] ecr_monitor[NUM_ECRS],
+    input logic [NUM_ECRS-1:0] ecr_in_use,
 
-    // Issue -> ECR：统一更新（reset + bpinfo + altpc）
+    // Issue -> ECR：统一更新（reset + bpinfo）
     output ecr_reset_for_issue#(NUM_ECRS)::t ecr_update,
 
     // ECR -> BP：由 ECR 产生更新，issue_controller 仅转接
@@ -61,31 +58,39 @@ module issue_controller #(
     logic jr_waiting;
     logic [ID_WIDTH-1:0] jr_wait_issue_id;
 
-    logic rollback_hold;
-    logic [ECR_W-1:0] rollback_ecr;
+    logic [NUM_ECRS-1:0] ecr_poison_pending;
+    logic [NUM_ECRS-1:0] ecr_free_pending;
 
     // 当前依赖链 ECR（写入 packet.dep_ecr_id）
     logic [ECR_W-1:0] active_ecr;
+    logic [ECR_W-1:0] ecr_alloc_ptr;
 
     // 逻辑寄存器映射表（RAT）：只跟踪 1..31，$0 恒为 PR0
     typedef struct {logic [PR_W-1:0] rat[31:1];} rename_state_t;
 
-    rename_state_t             cur_state;
+    rename_state_t                cur_state;
 
     // 检查点：每个 ECR 一份（保存 RAT）
-    rename_state_t             ckpt_state       [NUM_ECRS];
-    logic                      ckpt_valid       [NUM_ECRS];
+    rename_state_t                ckpt_state       [NUM_ECRS];
+    logic                         ckpt_valid       [NUM_ECRS];
+    logic          [        31:0] ckpt_alt_pc      [NUM_ECRS];
+    logic          [ID_WIDTH-1:0] ckpt_age         [NUM_ECRS];
+
+    logic                         ckpt_has_child   [NUM_ECRS];
+    logic                         rb_found;
+    logic          [   ECR_W-1:0] rb_id;
+    logic          [        31:0] rb_target_pc;
     // parent 指针：记录该检查点创建前的依赖链，用于回滚时恢复 active_ecr
-    logic          [ECR_W-1:0] ckpt_parent      [NUM_ECRS];
-    logic                      ckpt_parent_valid[NUM_ECRS];
+    logic          [   ECR_W-1:0] ckpt_parent      [NUM_ECRS];
+    logic                         ckpt_parent_valid[NUM_ECRS];
     // 本地保留位：用于避免同一拍/相邻拍对同一 ECR 误分配
-    logic                      ecr_pending_busy [NUM_ECRS];
+    logic                         ecr_pending_busy [NUM_ECRS];
     // 记录该检查点是否进入过非空闲态（00/10），用于回收策略
-    logic                      ckpt_seen_nonfree[NUM_ECRS];
+    logic                         ckpt_seen_nonfree[NUM_ECRS];
 
     // branch predictor + decoder（按取指 slot 索引）
-    logic                      pred_taken_w     [NUM_SICS];
-    instr_info_t               dec_info         [NUM_SICS];
+    logic                         pred_taken_w     [NUM_SICS];
+    instr_info_t                  dec_info         [NUM_SICS];
 
     genvar k;
     generate
@@ -108,7 +113,6 @@ module issue_controller #(
 
     // 基本连线
     assign imem_addr = pc;
-    assign rollback_trigger = ecr_status.rollback_valid;
 
     // 从“当前 + 所有有效快照”求一个 used bitmap（只做一次，后续本周期分配只会把 0->1）
     // Map logical register to physical register; $0 is always PR0.
@@ -143,15 +147,41 @@ module issue_controller #(
         return found;
     endfunction
 
+    always_comb begin
+        logic [ID_WIDTH-1:0] best_age;
+        for (int e = 0; e < NUM_ECRS; e++) ckpt_has_child[e] = 1'b0;
+        for (int e = 0; e < NUM_ECRS; e++) begin
+            if (ckpt_valid[e] && ckpt_parent_valid[e]) ckpt_has_child[ckpt_parent[e]] = 1'b1;
+        end
+
+        rb_found = 1'b0;
+        rb_id = '0;
+        rb_target_pc = 32'b0;
+        best_age = '0;
+        for (int e = 1; e < NUM_ECRS; e++) begin
+            if (ckpt_valid[e] && (ecr_monitor[e] == 2'b10)) begin
+                if (!rb_found || (ckpt_age[e] < best_age)) begin
+                    rb_found = 1'b1;
+                    rb_id = e[ECR_W-1:0];
+                    best_age = ckpt_age[e];
+                end
+            end
+        end
+        if (rb_found) rb_target_pc = ckpt_alt_pc[rb_id];
+    end
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pc <= 32'h0000_3000;
             global_issue_id <= '0;
             jr_waiting <= 1'b0;
             jr_wait_issue_id <= '0;
-            rollback_hold <= 1'b0;
-            rollback_ecr <= '0;
+            rollback_trigger <= 1'b0;
+            ecr_poison_pending <= '0;
+            ecr_free_pending <= '0;
             active_ecr <= '0;
+            if (NUM_ECRS > 1) ecr_alloc_ptr <= ECR_W'(1);
+            else ecr_alloc_ptr <= '0;
             ecr_update <= '0;
             // 初始化 RAT：lr[i] -> pr[i] (exclude $0)
             for (int i = 1; i < 32; i++) begin
@@ -159,6 +189,8 @@ module issue_controller #(
             end
             for (int e = 0; e < NUM_ECRS; e++) begin
                 ckpt_valid[e] <= 1'b0;
+                ckpt_alt_pc[e] <= 32'b0;
+                ckpt_age[e] <= '0;
                 ckpt_parent[e] <= '0;
                 ckpt_parent_valid[e] <= 1'b0;
                 ecr_pending_busy[e] <= 1'b0;
@@ -175,6 +207,7 @@ module issue_controller #(
         end else begin
             // 默认：不更新 ECR / 不分配 RF 生命周期 / 不发射
             ecr_update <= '0;
+            rollback_trigger <= rb_found;
             for (int s = 0; s < NUM_SICS; s++) begin
                 sic_packet_out[s] <= '0;
                 sic_packet_out[s].valid <= 1'b0;
@@ -194,42 +227,68 @@ module issue_controller #(
                 end
                 if (ckpt_valid[e] &&
                     (ecr_monitor[e] == 2'b01) &&
-                    (ecr_status.in_use[e] == 1'b0) &&
                     ckpt_seen_nonfree[e] &&
-                    !ecr_pending_busy[e]) begin
+                    !ecr_pending_busy[e] &&
+                    !ckpt_has_child[e]) begin
                     ckpt_valid[e] <= 1'b0;
                     ckpt_parent_valid[e] <= 1'b0;
                     ckpt_seen_nonfree[e] <= 1'b0;
                 end
             end
 
-            if (rollback_hold) begin
-                if (!ecr_status.in_use[rollback_ecr]) begin
-                    ecr_update.wen <= 1'b1;
-                    ecr_update.addr <= rollback_ecr;
-                    ecr_update.do_reset <= 1'b1;
-                    ecr_update.reset_data <= 2'b01;
-                    rollback_hold <= 1'b0;
+            if (|ecr_poison_pending) begin
+                for (int e = 1; e < NUM_ECRS; e++) begin
+                    if (ecr_poison_pending[e]) begin
+                        ecr_update.wen <= 1'b1;
+                        ecr_update.addr <= e[ECR_W-1:0];
+                        ecr_update.do_reset <= 1'b1;
+                        ecr_update.reset_data <= 2'b10;
+                        ecr_poison_pending[e] <= 1'b0;
+                        break;
+                    end
                 end
-            end else if (ecr_status.rollback_valid) begin
-                int rid;
-                logic [ECR_W-1:0] rid_bits;
-                rid = ecr_status.rollback_id;
-                pc <= ecr_status.rollback_target_pc;
+            end else if (|ecr_free_pending) begin
+                for (int e = 1; e < NUM_ECRS; e++) begin
+                    if (ecr_free_pending[e] && !ecr_in_use[e]) begin
+                        ecr_update.wen <= 1'b1;
+                        ecr_update.addr <= e[ECR_W-1:0];
+                        ecr_update.do_reset <= 1'b1;
+                        ecr_update.reset_data <= 2'b01;
+                        ecr_free_pending[e] <= 1'b0;
+                        break;
+                    end
+                end
+            end else if (rb_found) begin
+                int                  rid;
+                logic [   ECR_W-1:0] rid_bits;
+                logic [   ECR_W-1:0] parent_id;
+                logic                parent_valid;
+                logic [NUM_ECRS-1:0] kill_ckpt;
+                rid = rb_id;
+                pc <= rb_target_pc;
                 // 恢复检查点（若不存在则不改 RAT）
                 if (ckpt_valid[rid]) begin
                     for (int i = 1; i < 32; i++) begin
                         cur_state.rat[i] <= ckpt_state[rid].rat[i];
                     end
                 end
-                // 失效回滚检查点及其直接子节点（NUM_ECRS=2 时足够）
-                rid_bits = ecr_status.rollback_id;
-                ckpt_valid[rid] <= 1'b0;
-                ckpt_parent_valid[rid] <= 1'b0;
-                ckpt_seen_nonfree[rid] <= 1'b0;
-                ecr_pending_busy[rid] <= 1'b0;
+                rid_bits = rb_id;
+                parent_id = ckpt_parent[rid];
+                parent_valid = ckpt_parent_valid[rid];
+
+                kill_ckpt = '0;
+                kill_ckpt[rid] = 1'b1;
+                for (int it = 0; it < NUM_ECRS; it++) begin
+                    for (int e = 0; e < NUM_ECRS; e++) begin
+                        if (!kill_ckpt[e] && ckpt_valid[e] && ckpt_parent_valid[e] &&
+                            kill_ckpt[ckpt_parent[e]]) begin
+                            kill_ckpt[e] = 1'b1;
+                        end
+                    end
+                end
+
                 for (int e = 0; e < NUM_ECRS; e++) begin
-                    if (ckpt_valid[e] && ckpt_parent_valid[e] && (ckpt_parent[e] == rid_bits)) begin
+                    if (kill_ckpt[e]) begin
                         ckpt_valid[e] <= 1'b0;
                         ckpt_parent_valid[e] <= 1'b0;
                         ckpt_seen_nonfree[e] <= 1'b0;
@@ -237,10 +296,14 @@ module issue_controller #(
                     end
                 end
                 jr_waiting <= 1'b0;
-                rollback_hold <= 1'b1;
-                rollback_ecr <= ecr_status.rollback_id;
+                for (int e = 1; e < NUM_ECRS; e++) begin
+                    if (kill_ckpt[e]) begin
+                        ecr_free_pending[e] <= 1'b1;
+                        if (e[ECR_W-1:0] != rb_id) ecr_poison_pending[e] <= 1'b1;
+                    end
+                end
                 // 恢复依赖链到 parent（未知则置 00）
-                if (ckpt_parent_valid[rid]) active_ecr <= ckpt_parent[rid];
+                if (parent_valid) active_ecr <= parent_id;
                 else active_ecr <= '0;
             end else if (jr_waiting) begin
                 // 3) JR 等待：暂停发射直到重定向到来
@@ -270,6 +333,7 @@ module issue_controller #(
                 rename_state_t st_work;
                 logic [NUM_PHY_REGS-1:0] used_work;
                 logic [ECR_W-1:0] active_ecr_work;
+                logic [ECR_W-1:0] ecr_alloc_ptr_work;
 
                 issued = 0;
                 next_pc = pc;
@@ -280,6 +344,7 @@ module issue_controller #(
                 // 工作副本：同周期按发射顺序滚动更新
                 st_work = cur_state;
                 active_ecr_work = active_ecr;
+                ecr_alloc_ptr_work = ecr_alloc_ptr;
 
                 // used = cur_state + 所有有效 ckpt_state + pr_not_idle
                 used_work = calc_used_pr(st_work);
@@ -302,6 +367,10 @@ module issue_controller #(
                         logic [31:0] br_tgt;
                         logic [31:0] fall;
                         logic [31:0] j_tgt;
+                        logic [NUM_ECRS-1:0] forbid_ecr;
+                        logic [ECR_W-1:0] walk;
+                        logic alloc_ok;
+                        int cand;
 
                         slot = issued;
 
@@ -365,26 +434,42 @@ module issue_controller #(
                             sic_packet_out[sic].valid <= 1'b0;
                             stall = 1'b1;
                         end else if (!stall && (dec_info[slot].cf_kind == CF_BRANCH)) begin
-                            // 若该 ECR 处于本地 pending，则视为不可分配
-                            if (!ecr_status.alloc_avail || ecr_pending_busy[ecr_status.alloc_id]) begin
+                            forbid_ecr = '0;
+                            walk = active_ecr_work;
+                            for (int it = 0; it < NUM_ECRS; it++) begin
+                                forbid_ecr[walk] = 1'b1;
+                                if (walk == '0) break;
+                                if (!ckpt_parent_valid[walk]) break;
+                                walk = ckpt_parent[walk];
+                            end
+
+                            alloc_ok = 1'b0;
+                            alloc_e  = '0;
+                            for (int off = 0; off < (NUM_ECRS - 1); off++) begin
+                                cand = int'(ecr_alloc_ptr_work) + off;
+                                if (cand >= NUM_ECRS) cand = cand - (NUM_ECRS - 1);
+                                if (!alloc_ok &&
+                                    !forbid_ecr[cand] && !ckpt_valid[cand] &&
+                                    !ecr_pending_busy[cand] && (ecr_monitor[cand] == 2'b01)) begin
+                                    alloc_ok = 1'b1;
+                                    alloc_e  = cand[ECR_W-1:0];
+                                end
+                            end
+
+                            if (!alloc_ok) begin
                                 sic_packet_out[sic] <= '0;
                                 sic_packet_out[sic].valid <= 1'b0;
                                 stall = 1'b1;
                             end else begin
-                                alloc_e = ecr_status.alloc_id;
-
-                                // 保存检查点：以分支点之前状态作为回滚恢复点
                                 ckpt_state[alloc_e] <= st_work;
                                 ckpt_valid[alloc_e] <= 1'b1;
                                 ckpt_parent[alloc_e] <= active_ecr_work;
                                 ckpt_parent_valid[alloc_e] <= 1'b1;
-                                // 本地保留直到 monitor 反映非空闲态
                                 ecr_pending_busy[alloc_e] <= 1'b1;
                                 ckpt_seen_nonfree[alloc_e] <= 1'b0;
 
                                 sic_packet_out[sic].set_ecr_id <= alloc_e;
 
-                                // 置 ECR busy，同时写分支信息与 altpc
                                 ecr_update.wen <= 1'b1;
                                 ecr_update.addr <= alloc_e;
                                 ecr_update.do_reset <= 1'b1;
@@ -392,11 +477,13 @@ module issue_controller #(
                                 ecr_update.do_bpinfo <= 1'b1;
                                 ecr_update.bpinfo_pc <= pc + (slot << 2);
                                 ecr_update.bpinfo_pred_taken <= pred_taken_w[slot];
-                                ecr_update.do_altpc <= 1'b1;
 
-                                // 更新依赖链：后续指令依赖新 ECR
+                                ecr_alloc_ptr_work = (alloc_e == (NUM_ECRS-1)) ? ECR_W'(1) : (alloc_e + 1);
+
                                 active_ecr_work = alloc_e;
                                 branch_issued = 1'b1;
+
+                                ckpt_age[alloc_e] <= global_issue_id + ID_WIDTH'(slot);
 
                                 ip = pc + (slot << 2);
                                 br_tgt = ip + 32'd4 + (dec_info[slot].imm16_sign_ext << 2);
@@ -404,12 +491,12 @@ module issue_controller #(
 
                                 if (pred_taken_w[slot]) begin
                                     sic_packet_out[sic].next_pc_pred <= br_tgt;
-                                    ecr_update.altpc_pc <= fall;
+                                    ckpt_alt_pc[alloc_e] <= fall;
                                     next_pc = br_tgt;
                                     cut_packet = 1'b1;
                                 end else begin
                                     sic_packet_out[sic].next_pc_pred <= fall;
-                                    ecr_update.altpc_pc <= br_tgt;
+                                    ckpt_alt_pc[alloc_e] <= br_tgt;
                                 end
                             end
                         end else if (!stall && (dec_info[slot].cf_kind == CF_JUMP_IMM)) begin
@@ -435,6 +522,7 @@ module issue_controller #(
                 // 提交本周期状态
                 cur_state <= st_work;
                 active_ecr <= active_ecr_work;
+                ecr_alloc_ptr <= ecr_alloc_ptr_work;
                 global_issue_id <= global_issue_id + ID_WIDTH'(issued);
                 if (issued > 0) begin
                     if (!jr_waiting) begin
@@ -445,7 +533,5 @@ module issue_controller #(
             end
         end
     end
-
-    assign active_ecr_id = active_ecr;
 
 endmodule

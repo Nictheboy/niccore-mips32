@@ -18,8 +18,7 @@
 
 module execution_condition_register_file #(
     parameter int NUM_ECRS,
-    parameter int NUM_SICS,
-    parameter int ID_WIDTH
+    parameter int NUM_SICS
 ) (
     input logic clk,
     input logic rst_n,
@@ -38,13 +37,11 @@ module execution_condition_register_file #(
 
     // === Issue Controller 更新接口（打包）===
     input ecr_reset_for_issue#(NUM_ECRS)::t issue_update,
-    input logic [$clog2(NUM_ECRS)-1:0] issue_active_ecr_id,
 
     // ECR -> BP：由 ECR 内部在分支结果确定时产生更新（单周期脉冲）
     output bp_update_t bp_update,
 
-    // ECR -> Issue：汇总状态（allocator + rollback + in_use）
-    output ecr_status_for_issue#(NUM_ECRS)::t status_for_issue,
+    output logic [NUM_ECRS-1:0] in_use,
 
     // 监控接口
     output logic [1:0] monitor_states[NUM_ECRS]
@@ -52,23 +49,16 @@ module execution_condition_register_file #(
 
     // ECR 寄存器堆 (00=Busy/Undefined, 01=Correct/Free, 10=Incorrect)
     // 复位值为 01
-    logic [1:0] ecr_regs[NUM_ECRS];
-
-    // 分配指针：用于 round-robin 选择下一个 ECR，避免 reset 后总是分配 0
-    localparam int ECR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
-    logic [ECR_W-1:0] alloc_ptr;
+    logic [ 1:0] ecr_regs             [NUM_ECRS];
 
     // 分支元数据：由 issue_controller 在分配 ECR 时写入
-    logic [     31:0] ecr_branch_pc        [NUM_ECRS];
-    logic             ecr_branch_pred_taken[NUM_ECRS];
-    logic [     31:0] ecr_alt_pc           [NUM_ECRS];
+    logic [31:0] ecr_branch_pc        [NUM_ECRS];
+    logic        ecr_branch_pred_taken[NUM_ECRS];
 
     // 读逻辑 (异步广播)
     always_comb begin
         logic [NUM_ECRS-1:0] in_use_local;
         in_use_local = '0;
-
-        status_for_issue = '0;
 
         for (int i = 0; i < NUM_SICS; i++) begin
             // 直接索引读取。如果地址越界(虽不应发生)，给个默认值
@@ -83,34 +73,7 @@ module execution_condition_register_file #(
                 in_use_local[sic_read_addr[i]] = 1'b1;
             end
         end
-
-        status_for_issue.in_use = in_use_local;
-
-        // allocator：round-robin 从 alloc_ptr 开始扫描，避免 reset 后总是分配 0
-        for (int off = 0; off < NUM_ECRS; off++) begin
-            int k;
-            k = (alloc_ptr + off) % NUM_ECRS;
-            if (!status_for_issue.alloc_avail) begin
-                if ((k[$clog2(
-                        NUM_ECRS
-                    )-1:0] != issue_active_ecr_id) && (ecr_regs[k] == 2'b01) &&
-                        !in_use_local[k]) begin
-                    status_for_issue.alloc_avail = 1'b1;
-                    status_for_issue.alloc_id    = k[$clog2(NUM_ECRS)-1:0];
-                end
-            end
-        end
-
-        // rollback：若任一 ECR 为 10，则请求回滚（固定优先级：编号小者优先）
-        for (int k = 0; k < NUM_ECRS; k++) begin
-            if (!status_for_issue.rollback_valid) begin
-                if (ecr_regs[k] == 2'b10) begin
-                    status_for_issue.rollback_valid     = 1'b1;
-                    status_for_issue.rollback_id        = k[$clog2(NUM_ECRS)-1:0];
-                    status_for_issue.rollback_target_pc = ecr_alt_pc[k];
-                end
-            end
-        end
+        in_use = in_use_local;
 
         for (int k = 0; k < NUM_ECRS; k++) begin
             monitor_states[k] = ecr_regs[k];
@@ -126,11 +89,7 @@ module execution_condition_register_file #(
                 ecr_regs[k] <= 2'b01;  // Reset to Correct/Free
                 ecr_branch_pc[k] <= 32'b0;
                 ecr_branch_pred_taken[k] <= 1'b0;
-                ecr_alt_pc[k] <= 32'b0;
             end
-            // 对 NUM_ECRS=2：reset 后优先分配 1，符合“初始依赖 ecr0，第一条分支写 ecr1”的预期
-            if (NUM_ECRS > 1) alloc_ptr <= ECR_W'(1);
-            else alloc_ptr <= '0;
             bp_update <= '0;
         end else begin
             // 默认不更新 BP（脉冲）
@@ -142,18 +101,6 @@ module execution_condition_register_file #(
                     ecr_branch_pc[issue_update.addr] <= issue_update.bpinfo_pc;
                     ecr_branch_pred_taken[issue_update.addr] <= issue_update.bpinfo_pred_taken;
                 end
-                if (issue_update.do_altpc) begin
-                    ecr_alt_pc[issue_update.addr] <= issue_update.altpc_pc;
-                end
-            end
-
-            // 当 issue 分配新分支（reset_data=00）时，推进 alloc_ptr 到下一个位置
-            if (issue_update.wen && issue_update.do_reset &&
-                (issue_update.addr < NUM_ECRS) && (issue_update.reset_data == 2'b00)) begin
-                if (NUM_ECRS > 1)
-                    alloc_ptr <= (issue_update.addr == (NUM_ECRS-1)) ? '0
-                                                                                   : (issue_update.addr + 1);
-                else alloc_ptr <= '0;
             end
 
             // 对每个 ECR，检查是否有写请求

@@ -13,7 +13,7 @@ module superscalar_machine (
     localparam int NUM_SICS = 8;
     localparam int NUM_PHY_REGS = 64;
     localparam int NUM_ALUS = 8;
-    localparam int NUM_ECRS = 2;
+    localparam int NUM_ECRS = 4;
     localparam int ID_WIDTH = 16;
     localparam int TOTAL_REG_PORTS = NUM_SICS * 3;
     localparam int ECR_ADDR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
@@ -42,10 +42,8 @@ module superscalar_machine (
     logic [1:0] ecr_monitor[NUM_ECRS];
     logic rollback_sig;
 
-    // Issue <-> ECR（打包）
     ecr_reset_for_issue #(NUM_ECRS)::t issue_ecr_update;
-    ecr_status_for_issue #(NUM_ECRS)::t ecr_status;
-    logic [ECR_ADDR_W-1:0] issue_active_ecr_id;
+    logic [NUM_ECRS-1:0] ecr_in_use;
 
     // ECR -> BP：更新（由 ECR 产生）
     bp_update_t ecr_bp_update;
@@ -115,9 +113,8 @@ module superscalar_machine (
         .sic_pc_redirect_pc(sic_pc_redirect_pc),
         .sic_pc_redirect_issue_id(sic_pc_redirect_issue_id),
         .rollback_trigger(rollback_sig),
-        .active_ecr_id(issue_active_ecr_id),
-        .ecr_status(ecr_status),
         .ecr_monitor(ecr_monitor),
+        .ecr_in_use(ecr_in_use),
         .ecr_update(issue_ecr_update),
         .bp_update(ecr_bp_update),
         // Register File allocate pulse
@@ -229,8 +226,7 @@ module superscalar_machine (
     // 确保代码中没有其他地方对 sic_ecr_read_data 进行赋值
     execution_condition_register_file #(
         .NUM_ECRS(NUM_ECRS),
-        .NUM_SICS(NUM_SICS),
-        .ID_WIDTH(ID_WIDTH)
+        .NUM_SICS(NUM_SICS)
     ) ecr_file (
         .clk(clk),
         .rst_n(rst_n),
@@ -241,9 +237,8 @@ module superscalar_machine (
         .sic_write_addr(sic_ecr_write_addr),
         .sic_wdata(sic_ecr_wdata),
         .issue_update(issue_ecr_update),
-        .issue_active_ecr_id(issue_active_ecr_id),
         .bp_update(ecr_bp_update),
-        .status_for_issue(ecr_status),
+        .in_use(ecr_in_use),
         .monitor_states(ecr_monitor)
     );
 
