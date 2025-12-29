@@ -67,6 +67,7 @@ module instruction_decoder (
     wire is_xor = is_r_type && (func_code == 6'h26);
     wire is_sll = is_r_type && (func_code == 6'h00);
     wire is_srl = is_r_type && (func_code == 6'h02);
+    wire is_sltu = is_r_type && (func_code == 6'h2b);
     wire is_jr = is_r_type && (func_code == 6'h08);
     wire is_syscall = is_r_type && (func_code == 6'h0c);
 
@@ -86,7 +87,7 @@ module instruction_decoder (
     wire is_j = (opc == OPC_J);
     wire is_jal = (opc == OPC_JAL);
 
-    wire is_alu_r = is_addu | is_subu | is_or | is_xor | is_sll | is_srl;
+    wire is_alu_r = is_addu | is_subu | is_or | is_xor | is_sll | is_srl | is_sltu;
     wire is_alu_i = is_andi | is_ori | is_xori | is_addiu | is_slti;
 
     // 写回选择
