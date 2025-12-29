@@ -21,7 +21,8 @@ module superscalar_machine (
     localparam int IMEM_DEPTH = 1024;
     localparam logic [31:0] IMEM_START_BYTE_ADDR = 32'h0000_3000;
     // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-1.txt";
-    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-2.txt";
+    // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-2.txt";
+    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-4.txt";
     localparam int DMEM_DEPTH = 2048;
     localparam int DMEM_NUM_BANKS = 4;
 
