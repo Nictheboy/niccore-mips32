@@ -3,7 +3,7 @@
  *
  * Supported instructions:
  * - R-Type: addu, subu, jr, syscall
- * - I-Type: ori, xori, addiu, slti, lw, sw, beq, bne, lui
+ * - I-Type: andi, ori, xori, addiu, slti, lw, sw, beq, bne, lui
  * - J-Type: j, jal
  */
 
@@ -19,6 +19,7 @@ function automatic opcode_t opcode_enum(input logic [5:0] raw);
             6'h05:   r = OPC_BNE;
             6'h02:   r = OPC_J;
             6'h03:   r = OPC_JAL;
+            6'h0c:   r = OPC_ANDI;
             6'h0d:   r = OPC_ORI;
             6'h0e:   r = OPC_XORI;
             6'h09:   r = OPC_ADDIU;
@@ -64,6 +65,7 @@ module instruction_decoder (
     wire is_syscall = is_r_type && (func_code == 6'h0c);
 
     // I/J-Type 判定
+    wire is_andi = (opc == OPC_ANDI);
     wire is_ori = (opc == OPC_ORI);
     wire is_xori = (opc == OPC_XORI);
     wire is_addiu = (opc == OPC_ADDIU);
@@ -77,7 +79,7 @@ module instruction_decoder (
     wire is_jal = (opc == OPC_JAL);
 
     wire is_alu_r = is_addu | is_subu;
-    wire is_alu_i = is_ori | is_xori | is_addiu | is_slti;
+    wire is_alu_i = is_andi | is_ori | is_xori | is_addiu | is_slti;
 
     // 写回选择
     wb_sel_t wb_sel_int;
@@ -109,15 +111,15 @@ module instruction_decoder (
     wire write_ecr_int = is_beq | is_bne;
 
     // ALU 控制（use_alu_int=1 时有效）
-    wire [5:0] alu_op_int = is_alu_r ? func_code :
-    is_ori  ? 6'h25 :  // OR
+    wire [5:0] alu_op_int = is_alu_r ? func_code : is_andi ? 6'h24 :  // AND
+    is_ori ? 6'h25 :  // OR
     is_xori ? 6'h26 :  // XOR
-    is_addiu ? 6'h21 : // ADDU (ignore overflow)
+    is_addiu ? 6'h21 :  // ADDU (ignore overflow)
     is_slti ? 6'h2a :  // SLT (signed)
     (is_beq | is_bne) ? 6'h22 :  // SUB (check zero)
     6'h00;
     wire alu_b_is_imm_int = is_alu_i;
-    wire alu_imm_is_zero_ext_int = is_ori | is_xori;
+    wire alu_imm_is_zero_ext_int = is_andi | is_ori | is_xori;
 
     // 写回来源
     always_comb begin

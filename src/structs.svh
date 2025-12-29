@@ -31,6 +31,7 @@ typedef enum logic [5:0] {
     OPC_BNE,
     OPC_J,
     OPC_JAL,
+    OPC_ANDI,
     OPC_ORI,
     OPC_XORI,
     OPC_ADDIU,
