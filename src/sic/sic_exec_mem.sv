@@ -7,7 +7,7 @@
  * - 用 `busy` / `mem_wait` 两个寄存器描述“是否有在飞指令 / 是否已进入访存阶段”。
  * - 其余“阶段”不显式编码，而是用 ready 条件组合推导：
  *   - `rf_ok`：所需的源寄存器值已就绪（reg_ans.*_valid=1 时数据可用）
- *   - `ecr_ok`：不依赖 ECR，或依赖的 ECR 已为 01
+ *   - `ecr_ok`：依赖的 ECR 已为 01（用于约束“不可回滚副作用”，例如 store）
  *   - `abort_mispredict`：依赖的 ECR 为 10，则丢弃当前指令
  *
  * 时序要点：
@@ -107,7 +107,7 @@ module sic_exec_mem #(
                     busy <= 1'b0;
                     mem_wait <= 1'b0;
                 end else if (!mem_wait) begin
-                    if (rf_ok && ecr_ok) begin
+                    if (rf_ok && (pkt.info.mem_read || ecr_ok)) begin
                         mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
                         mem_wdata_hold <= reg_ans.rt_rdata;
                         mem_wait <= 1'b1;

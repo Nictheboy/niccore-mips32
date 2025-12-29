@@ -59,7 +59,8 @@ module sic_exec_alu #(
                                                          : pkt.info.imm16_sign_ext)
                          : reg_ans.rt_rdata;
 
-        commit_now = busy && rf_ok && ecr_ok && (!need_alu || in.alu_grant) && !abort_mispredict;
+        commit_now = busy && rf_ok && (!need_alu || in.alu_grant) && !abort_mispredict &&
+                     (!pkt.info.write_ecr || ecr_ok);
 
         // RF commit (WB_ALU)
         out.reg_req = '0;

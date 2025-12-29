@@ -9,7 +9,7 @@
  * - 以及其它不需要读取 RS/RT、也不需要产生重定向的“简单指令”（默认作为兜底）
  *
  * 规则：
- * - 只在 dep_ecr 有效时等待 ECR==01；ECR==10 则丢弃。
+ * - 若 dep_ecr 为 10，则丢弃当前指令。
  * - `req_instr` 必须在 `packet_in.valid==1` 的周期保持为 0，避免 issue 连发导致丢包。
  */
 
@@ -48,7 +48,7 @@ module sic_exec_imm #(
 
         out.req_instr = !busy && !packet_in.valid;
 
-        commit_now = busy && ecr_ok && !abort_mispredict;
+        commit_now = busy && !abort_mispredict;
 
         out.reg_req = '0;
         unique case (pkt.info.wb_sel)
