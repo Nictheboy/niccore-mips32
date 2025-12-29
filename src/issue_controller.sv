@@ -19,14 +19,16 @@ module issue_controller #(
     input logic [NUM_SICS-1:0][31:0] imem_data,
 
     // SIC 交互接口
-    input  logic                       sic_req_instr           [NUM_SICS],
+    input logic sic_req_instr[NUM_SICS],
     output sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packet_out[NUM_SICS],
-    input  logic                       sic_pc_redirect_valid   [NUM_SICS],
-    input  logic        [        31:0] sic_pc_redirect_pc      [NUM_SICS],
-    input  logic        [ID_WIDTH-1:0] sic_pc_redirect_issue_id[NUM_SICS],
+    input logic sic_pc_redirect_valid[NUM_SICS],
+    input logic [31:0] sic_pc_redirect_pc[NUM_SICS],
+    input logic [ID_WIDTH-1:0] sic_pc_redirect_issue_id[NUM_SICS],
 
     // 回滚指示（调试/监控用）
     output logic rollback_trigger,
+
+    output logic [$clog2(NUM_ECRS)-1:0] active_ecr_id,
 
     // Register File allocate
     output logic rf_alloc_wen[NUM_SICS],
@@ -59,28 +61,31 @@ module issue_controller #(
     logic jr_waiting;
     logic [ID_WIDTH-1:0] jr_wait_issue_id;
 
+    logic rollback_hold;
+    logic [ECR_W-1:0] rollback_ecr;
+
     // 当前依赖链 ECR（写入 packet.dep_ecr_id）
-    logic [ECR_W:0] active_ecr;
+    logic [ECR_W-1:0] active_ecr;
 
     // 逻辑寄存器映射表（RAT）：只跟踪 1..31，$0 恒为 PR0
     typedef struct {logic [PR_W-1:0] rat[31:1];} rename_state_t;
 
-    rename_state_t       cur_state;
+    rename_state_t             cur_state;
 
     // 检查点：每个 ECR 一份（保存 RAT）
-    rename_state_t       ckpt_state       [NUM_ECRS];
-    logic                ckpt_valid       [NUM_ECRS];
+    rename_state_t             ckpt_state       [NUM_ECRS];
+    logic                      ckpt_valid       [NUM_ECRS];
     // parent 指针：记录该检查点创建前的依赖链，用于回滚时恢复 active_ecr
-    logic [ECR_W:0] ckpt_parent      [NUM_ECRS];
-    logic                ckpt_parent_valid[NUM_ECRS];
+    logic          [ECR_W-1:0] ckpt_parent      [NUM_ECRS];
+    logic                      ckpt_parent_valid[NUM_ECRS];
     // 本地保留位：用于避免同一拍/相邻拍对同一 ECR 误分配
-    logic                ecr_pending_busy [NUM_ECRS];
+    logic                      ecr_pending_busy [NUM_ECRS];
     // 记录该检查点是否进入过非空闲态（00/10），用于回收策略
-    logic                ckpt_seen_nonfree[NUM_ECRS];
+    logic                      ckpt_seen_nonfree[NUM_ECRS];
 
     // branch predictor + decoder（按取指 slot 索引）
-    logic                pred_taken_w     [NUM_SICS];
-    instr_info_t         dec_info         [NUM_SICS];
+    logic                      pred_taken_w     [NUM_SICS];
+    instr_info_t               dec_info         [NUM_SICS];
 
     genvar k;
     generate
@@ -144,6 +149,8 @@ module issue_controller #(
             global_issue_id <= '0;
             jr_waiting <= 1'b0;
             jr_wait_issue_id <= '0;
+            rollback_hold <= 1'b0;
+            rollback_ecr <= '0;
             active_ecr <= '0;
             ecr_update <= '0;
             // 初始化 RAT：lr[i] -> pr[i] (exclude $0)
@@ -196,10 +203,17 @@ module issue_controller #(
                 end
             end
 
-            // 2) 回滚：由 ECR 发起（任一 ECR==10）
-            if (ecr_status.rollback_valid) begin
+            if (rollback_hold) begin
+                if (!ecr_status.in_use[rollback_ecr]) begin
+                    ecr_update.wen <= 1'b1;
+                    ecr_update.addr <= rollback_ecr;
+                    ecr_update.do_reset <= 1'b1;
+                    ecr_update.reset_data <= 2'b01;
+                    rollback_hold <= 1'b0;
+                end
+            end else if (ecr_status.rollback_valid) begin
                 int rid;
-                logic [ECR_W:0] rid_bits;
+                logic [ECR_W-1:0] rid_bits;
                 rid = ecr_status.rollback_id;
                 pc <= ecr_status.rollback_target_pc;
                 // 恢复检查点（若不存在则不改 RAT）
@@ -209,7 +223,7 @@ module issue_controller #(
                     end
                 end
                 // 失效回滚检查点及其直接子节点（NUM_ECRS=2 时足够）
-                rid_bits = {1'b0, ecr_status.rollback_id};
+                rid_bits = ecr_status.rollback_id;
                 ckpt_valid[rid] <= 1'b0;
                 ckpt_parent_valid[rid] <= 1'b0;
                 ckpt_seen_nonfree[rid] <= 1'b0;
@@ -223,11 +237,8 @@ module issue_controller #(
                     end
                 end
                 jr_waiting <= 1'b0;
-                // Ack：将触发回滚的 ECR 写回 01，避免重复回滚
-                ecr_update.wen <= 1'b1;
-                ecr_update.addr <= ecr_status.rollback_id;
-                ecr_update.do_reset <= 1'b1;
-                ecr_update.reset_data <= 2'b01;
+                rollback_hold <= 1'b1;
+                rollback_ecr <= ecr_status.rollback_id;
                 // 恢复依赖链到 parent（未知则置 00）
                 if (ckpt_parent_valid[rid]) active_ecr <= ckpt_parent[rid];
                 else active_ecr <= '0;
@@ -258,7 +269,7 @@ module issue_controller #(
 
                 rename_state_t st_work;
                 logic [NUM_PHY_REGS-1:0] used_work;
-                logic [ECR_W:0] active_ecr_work;
+                logic [ECR_W-1:0] active_ecr_work;
 
                 issued = 0;
                 next_pc = pc;
@@ -302,7 +313,7 @@ module issue_controller #(
                         sic_packet_out[sic].info <= dec_info[slot];
                         sic_packet_out[sic].pred_taken <= pred_taken_w[slot];
                         sic_packet_out[sic].dep_ecr_id <= active_ecr_work;
-                        sic_packet_out[sic].set_ecr_id <= 'x;
+                        sic_packet_out[sic].set_ecr_id <= '0;
                         sic_packet_out[sic].next_pc_pred <= (pc + (slot << 2)) + 32'd4;
                         // 默认 phy_dst=PR0；若有真实 dst 将在下方覆盖
                         sic_packet_out[sic].phy_dst <= '0;
@@ -371,7 +382,7 @@ module issue_controller #(
                                 ecr_pending_busy[alloc_e] <= 1'b1;
                                 ckpt_seen_nonfree[alloc_e] <= 1'b0;
 
-                                sic_packet_out[sic].set_ecr_id <= {1'b0, alloc_e};
+                                sic_packet_out[sic].set_ecr_id <= alloc_e;
 
                                 // 置 ECR busy，同时写分支信息与 altpc
                                 ecr_update.wen <= 1'b1;
@@ -384,7 +395,7 @@ module issue_controller #(
                                 ecr_update.do_altpc <= 1'b1;
 
                                 // 更新依赖链：后续指令依赖新 ECR
-                                active_ecr_work = {1'b0, alloc_e};
+                                active_ecr_work = alloc_e;
                                 branch_issued = 1'b1;
 
                                 ip = pc + (slot << 2);
@@ -434,5 +445,7 @@ module issue_controller #(
             end
         end
     end
+
+    assign active_ecr_id = active_ecr;
 
 endmodule

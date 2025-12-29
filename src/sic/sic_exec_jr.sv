@@ -43,11 +43,9 @@ module sic_exec_jr #(
         out                      = '0;
 
         rf_ok                    = (!pkt.info.read_rs) || reg_ans.rs_valid;
-        ecr_ok                   = (!pkt.dep_ecr_id[ECR_W]) || (in.ecr_read_data == 2'b01);
+        ecr_ok                   = (in.ecr_read_data == 2'b01);
 
-        out.ecr_read_addr        = pkt.dep_ecr_id[ECR_W-1:0];
-        out.ecr_read_en          = busy && pkt.dep_ecr_id[ECR_W];
-        abort_mispredict         = out.ecr_read_en && (in.ecr_read_data == 2'b10);
+        abort_mispredict         = busy && (in.ecr_read_data == 2'b10);
 
         out.req_instr            = !busy && !packet_in.valid;
 

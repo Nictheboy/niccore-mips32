@@ -144,9 +144,8 @@ class sic_packet #(
 
         // 分支预测与 ECR
         logic          pred_taken;
-        // dep/set_ecr_id 编码为 {valid, id}
-        logic [ECR_W:0] dep_ecr_id;
-        logic [ECR_W:0] set_ecr_id;
+        logic [ECR_W-1:0] dep_ecr_id;
+        logic [ECR_W-1:0] set_ecr_id;
     } t;
 endclass
 
@@ -302,9 +301,7 @@ class sic_sub_out #(
         rpl_req#(ID_WIDTH)::t alu_rpl;
         alu_req_t             alu_req;
 
-        // // ECR
-        logic                 ecr_read_en;
-        logic [ECR_AW-1:0] ecr_read_addr;
+        // ECR
         logic                 ecr_wen;
         logic [ECR_AW-1:0] ecr_write_addr;
         logic [          1:0] ecr_wdata;

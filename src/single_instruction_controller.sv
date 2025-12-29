@@ -11,7 +11,7 @@ module single_instruction_controller #(
     input logic rst_n,
 
     // 与 Issue Controller 交互
-    output logic        req_instr,
+    output logic                                            req_instr,
     input  sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t packet_in,
 
     // 与 Register File 交互（打包接口）
@@ -32,13 +32,13 @@ module single_instruction_controller #(
 
     // 与 ECR 交互 (简化接口)
     // 读接口：直接输出地址，组合逻辑读取
-    output logic                 ecr_read_en,
+    output logic                                               ecr_read_en,
     output logic [((NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1)-1:0] ecr_read_addr,
-    input  logic [          1:0] ecr_read_data,
+    input  logic [                                        1:0] ecr_read_data,
     // 写接口：写使能和地址数据
-    output logic                 ecr_wen,
+    output logic                                               ecr_wen,
     output logic [((NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1)-1:0] ecr_write_addr,
-    output logic [          1:0] ecr_wdata,
+    output logic [                                        1:0] ecr_wdata,
 
     // === JR：提交后 PC 重定向反馈 ===
     output logic                pc_redirect_valid,
@@ -47,6 +47,7 @@ module single_instruction_controller #(
 );
 
     typedef sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packet_t;
+    localparam int ECR_AW = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
 
     // 选择子 SIC：接收 packet 的当拍用组合选择，后续用寄存选择保持稳定
     typedef enum logic [2:0] {
@@ -94,11 +95,13 @@ module single_instruction_controller #(
 
     // 子 SIC bundle
     sic_sub_in #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t in_alu, in_mem, in_imm, in_jr, in_syscall;
-    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t out_alu, out_mem, out_imm, out_jr, out_syscall;
+    sic_sub_out #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t
+        out_alu, out_mem, out_imm, out_jr, out_syscall;
     sic_sub_out #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t out_sel;
 
     // 保存最近一次接收到的 packet（用于 PR 占用声明在后续周期持续有效）
     sic_packet_t pkt_hold;
+    logic holding_exec;
 
     always_comb begin
         in_alu = '0;
@@ -240,8 +243,9 @@ module single_instruction_controller #(
         mem_req = out_sel.mem_req;
         alu_rpl = out_sel.alu_rpl;
         alu_req = out_sel.alu_req;
-        ecr_read_en = out_sel.ecr_read_en;
-        ecr_read_addr = out_sel.ecr_read_addr;
+        ecr_read_en = packet_in.valid | holding_exec;
+        ecr_read_addr = packet_in.valid ? packet_in.dep_ecr_id[ECR_AW-1:0] :
+                        holding_exec    ? pkt_hold.dep_ecr_id[ECR_AW-1:0] : '0;
         ecr_wen = out_sel.ecr_wen;
         ecr_write_addr = out_sel.ecr_write_addr;
         ecr_wdata = out_sel.ecr_wdata;
@@ -263,13 +267,16 @@ module single_instruction_controller #(
         if (!rst_n) begin
             sel_r <= SEL_IMM;
             pkt_hold <= '0;
+            holding_exec <= 1'b0;
         end else begin
-                        if (packet_in.valid) begin
+            if (packet_in.valid) begin
                 sel_r <= sel_now;
                 pkt_hold <= packet_in;
+                holding_exec <= 1'b1;
             end else if (req_instr) begin
                 // 全部子 SIC 均在请求指令 => 当前无在飞指令
                 sel_r <= SEL_IMM;
+                holding_exec <= 1'b0;
             end
         end
     end

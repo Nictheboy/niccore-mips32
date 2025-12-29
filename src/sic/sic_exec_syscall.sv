@@ -39,13 +39,11 @@ module sic_exec_syscall #(
     always_comb begin
         out = '0;
 
-        ecr_ok = (!pkt.dep_ecr_id[ECR_W]) || (in.ecr_read_data == 2'b01);
+        ecr_ok = (in.ecr_read_data == 2'b01);
         rf_ok = (!pkt.info.read_rs || in.reg_ans.rs_valid) &&
                 (!pkt.info.read_rt || in.reg_ans.rt_valid);
 
-        out.ecr_read_addr = pkt.dep_ecr_id[ECR_W-1:0];
-        out.ecr_read_en = busy && pkt.dep_ecr_id[ECR_W];
-        abort_mispredict = out.ecr_read_en && (in.ecr_read_data == 2'b10);
+        abort_mispredict = busy && (in.ecr_read_data == 2'b10);
 
         out.req_instr = !busy && !packet_in.valid;
 

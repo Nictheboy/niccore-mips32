@@ -38,6 +38,7 @@ module execution_condition_register_file #(
 
     // === Issue Controller 更新接口（打包）===
     input ecr_reset_for_issue#(NUM_ECRS)::t issue_update,
+    input logic [$clog2(NUM_ECRS)-1:0] issue_active_ecr_id,
 
     // ECR -> BP：由 ECR 内部在分支结果确定时产生更新（单周期脉冲）
     output bp_update_t bp_update,
@@ -90,7 +91,10 @@ module execution_condition_register_file #(
             int k;
             k = (alloc_ptr + off) % NUM_ECRS;
             if (!status_for_issue.alloc_avail) begin
-                if (ecr_regs[k] == 2'b01 && !in_use_local[k]) begin
+                if ((k[$clog2(
+                        NUM_ECRS
+                    )-1:0] != issue_active_ecr_id) && (ecr_regs[k] == 2'b01) &&
+                        !in_use_local[k]) begin
                     status_for_issue.alloc_avail = 1'b1;
                     status_for_issue.alloc_id    = k[$clog2(NUM_ECRS)-1:0];
                 end

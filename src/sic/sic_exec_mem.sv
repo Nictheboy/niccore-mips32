@@ -64,12 +64,9 @@ module sic_exec_mem #(
 
         // ready 条件（组合）
         rf_ok = (!pkt.info.read_rs || reg_ans.rs_valid) && (!pkt.info.read_rt || reg_ans.rt_valid);
-        ecr_ok = (!pkt.dep_ecr_id[ECR_W]) || (in.ecr_read_data == 2'b01);
+        ecr_ok = (in.ecr_read_data == 2'b01);
 
-        // ECR read: dep_ecr_id 编码为 {valid,id}
-        out.ecr_read_addr = pkt.dep_ecr_id[ECR_W-1:0];
-        out.ecr_read_en = busy && pkt.dep_ecr_id[ECR_W];
-        abort_mispredict = out.ecr_read_en && (in.ecr_read_data == 2'b10);
+        abort_mispredict = busy && (in.ecr_read_data == 2'b10);
 
         // req instr：必须把 packet_in.valid 也考虑进去，避免 issue 连发导致丢包
         out.req_instr = !busy && !packet_in.valid;

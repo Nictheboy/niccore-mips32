@@ -20,7 +20,7 @@ module superscalar_machine (
     localparam int BRANCH_PREDICTOR_TABLE_SIZE = 64;
     localparam int IMEM_DEPTH = 1024;
     localparam logic [31:0] IMEM_START_BYTE_ADDR = 32'h0000_3000;
-    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-1.txt";
+    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/mips1.txt";
     localparam int DMEM_DEPTH = 2048;
     localparam int DMEM_NUM_BANKS = 4;
 
@@ -30,7 +30,7 @@ module superscalar_machine (
 
     // SIC <-> Issue Controller
     logic sic_req_instr[NUM_SICS];
-    sic_packet#(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packets[NUM_SICS];
+    sic_packet #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t sic_packets[NUM_SICS];
     // SIC -> Issue：ECR 依赖反馈
     logic sic_ecr_read_en[NUM_SICS];
     // SIC -> Issue：JR PC 重定向反馈
@@ -45,6 +45,7 @@ module superscalar_machine (
     // Issue <-> ECR（打包）
     ecr_reset_for_issue #(NUM_ECRS)::t issue_ecr_update;
     ecr_status_for_issue #(NUM_ECRS)::t ecr_status;
+    logic [ECR_ADDR_W-1:0] issue_active_ecr_id;
 
     // ECR -> BP：更新（由 ECR 产生）
     bp_update_t ecr_bp_update;
@@ -114,6 +115,7 @@ module superscalar_machine (
         .sic_pc_redirect_pc(sic_pc_redirect_pc),
         .sic_pc_redirect_issue_id(sic_pc_redirect_issue_id),
         .rollback_trigger(rollback_sig),
+        .active_ecr_id(issue_active_ecr_id),
         .ecr_status(ecr_status),
         .ecr_monitor(ecr_monitor),
         .ecr_update(issue_ecr_update),
@@ -239,6 +241,7 @@ module superscalar_machine (
         .sic_write_addr(sic_ecr_write_addr),
         .sic_wdata(sic_ecr_wdata),
         .issue_update(issue_ecr_update),
+        .issue_active_ecr_id(issue_active_ecr_id),
         .bp_update(ecr_bp_update),
         .status_for_issue(ecr_status),
         .monitor_states(ecr_monitor)
