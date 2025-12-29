@@ -555,6 +555,7 @@ module issue_controller #(
                                     ckpt_parent[pend_ecr] <= pend_parent;
                                     ckpt_parent_valid[pend_ecr] <= 1'b1;
                                     ckpt_alt_pc[pend_ecr] <= pend_alt;
+                                    ckpt_seen_nonfree[pend_ecr] <= 1'b1;
                                     active_ecr_work = pend_ecr;
                                     if (pend_pred_taken) begin
                                         next_pc = pend_target;
