@@ -32,6 +32,7 @@ module sic_exec_alu #(
     logic        commit_now;
     logic        need_alu;
     logic        br_taken;
+    logic        is_shift;
 
     // 组合逻辑计算锁请求
     always_comb begin
@@ -51,13 +52,16 @@ module sic_exec_alu #(
         out.alu_rpl.req = busy && need_alu && !abort_mispredict;
         out.alu_rpl.release_lock = alu_release_pulse;
 
+        is_shift = (pkt.info.alu_op == 6'h00) || (pkt.info.alu_op == 6'h02) || (pkt.info.alu_op == 6'h03);
+
         // ALU request（组合生成；只有 grant=1 时 sic_alu_ans 才有效）
         out.alu_req.op = pkt.info.alu_op;
-        out.alu_req.a = reg_ans.rs_rdata;
-        out.alu_req.b  = pkt.info.alu_b_is_imm
-                         ? (pkt.info.alu_imm_is_zero_ext ? pkt.info.imm16_zero_ext
-                                                         : pkt.info.imm16_sign_ext)
-                         : reg_ans.rt_rdata;
+        out.alu_req.a = is_shift ? {27'b0, pkt.info.imm16[10:6]} : reg_ans.rs_rdata;
+        out.alu_req.b = is_shift ? reg_ans.rt_rdata :
+                      (pkt.info.alu_b_is_imm
+                           ? (pkt.info.alu_imm_is_zero_ext ? pkt.info.imm16_zero_ext
+                                                           : pkt.info.imm16_sign_ext)
+                           : reg_ans.rt_rdata);
 
         commit_now = busy && rf_ok && (!need_alu || in.alu_grant) && !abort_mispredict &&
                      (!pkt.info.write_ecr || ecr_ok);

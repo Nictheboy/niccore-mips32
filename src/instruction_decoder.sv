@@ -61,6 +61,10 @@ module instruction_decoder (
     // R-Type 具体功能判定
     wire is_addu = is_r_type && (func_code == 6'h21);
     wire is_subu = is_r_type && (func_code == 6'h23);
+    wire is_or = is_r_type && (func_code == 6'h25);
+    wire is_xor = is_r_type && (func_code == 6'h26);
+    wire is_sll = is_r_type && (func_code == 6'h00);
+    wire is_srl = is_r_type && (func_code == 6'h02);
     wire is_jr = is_r_type && (func_code == 6'h08);
     wire is_syscall = is_r_type && (func_code == 6'h0c);
 
@@ -78,7 +82,7 @@ module instruction_decoder (
     wire is_j = (opc == OPC_J);
     wire is_jal = (opc == OPC_JAL);
 
-    wire is_alu_r = is_addu | is_subu;
+    wire is_alu_r = is_addu | is_subu | is_or | is_xor | is_sll | is_srl;
     wire is_alu_i = is_andi | is_ori | is_xori | is_addiu | is_slti;
 
     // 写回选择
@@ -101,7 +105,7 @@ module instruction_decoder (
     end
 
     // 源寄存器读取需求
-    wire read_rs_int = is_alu_r | is_jr | is_alu_i | is_lw | is_sw | is_beq | is_bne;
+    wire read_rs_int = (is_alu_r && !(is_sll | is_srl)) | is_jr | is_alu_i | is_lw | is_sw | is_beq | is_bne;
     wire read_rt_int = is_alu_r | is_sw | is_beq | is_bne;
 
     // 资源/执行意图
