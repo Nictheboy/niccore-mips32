@@ -107,6 +107,10 @@ typedef struct packed {
     logic mem_read;
     logic mem_write;
 
+    logic       use_muldiv;
+    logic [2:0] muldiv_op;
+    logic       muldiv_start;
+
     // Branch metadata
     logic write_ecr;  // BEQ updates ECR
 
@@ -175,6 +179,18 @@ typedef struct packed {
     logic        over;
     logic        zero;
 } alu_ans_t;
+
+typedef struct packed {
+    logic [31:0] op1;
+    logic [31:0] op2;
+    logic [2:0]  op;
+    logic        start;
+} muldiv_req_t;
+
+typedef struct packed {
+    logic [31:0] data;
+    logic        busy;
+} muldiv_ans_t;
 
 // -----------------------------
 // Branch predictor update bundle
@@ -254,6 +270,8 @@ class sic_sub_in #(
         logic        mem_grant;
         alu_ans_t    alu_ans;
         logic        alu_grant;
+        muldiv_ans_t muldiv_ans;
+        logic        muldiv_grant;
         logic [1:0]  ecr_read_data;
     } t;
 endclass
@@ -277,6 +295,10 @@ class sic_sub_out #(
         // ALU
         rpl_req#(ID_WIDTH)::t alu_rpl;
         alu_req_t             alu_req;
+
+        // MULDIV
+        rpl_req#(ID_WIDTH)::t muldiv_rpl;
+        muldiv_req_t          muldiv_req;
 
         // ECR
         logic                 ecr_wen;

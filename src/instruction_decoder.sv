@@ -70,6 +70,14 @@ module instruction_decoder (
     wire is_sltu = is_r_type && (func_code == 6'h2b);
     wire is_jr = is_r_type && (func_code == 6'h08);
     wire is_syscall = is_r_type && (func_code == 6'h0c);
+    wire is_mult = is_r_type && (func_code == 6'h18);
+    wire is_multu = is_r_type && (func_code == 6'h19);
+    wire is_div = is_r_type && (func_code == 6'h1a);
+    wire is_divu = is_r_type && (func_code == 6'h1b);
+    wire is_mfhi = is_r_type && (func_code == 6'h10);
+    wire is_mthi = is_r_type && (func_code == 6'h11);
+    wire is_mflo = is_r_type && (func_code == 6'h12);
+    wire is_mtlo = is_r_type && (func_code == 6'h13);
 
     // I/J-Type 判定
     wire is_andi = (opc == OPC_ANDI);
@@ -89,14 +97,17 @@ module instruction_decoder (
 
     wire is_alu_r = is_addu | is_subu | is_or | is_xor | is_sll | is_srl | is_sltu;
     wire is_alu_i = is_andi | is_ori | is_xori | is_addiu | is_slti;
+    wire is_muldiv = is_mult | is_multu | is_div | is_divu | is_mfhi | is_mthi | is_mflo | is_mtlo;
 
     // 写回选择
     wb_sel_t wb_sel_int;
 
     // 目的逻辑寄存器号（用于重命名/执行）
-    wire write_gpr_int = is_alu_r | is_alu_i | is_lui | is_lw | is_lbu | is_jal;
+    wire write_gpr_int = is_alu_r | is_alu_i | is_lui | is_lw | is_lbu | is_jal | is_mfhi | is_mflo;
     wire [4:0] dst_lr_int =
         is_alu_r ? instr[15:11] :
+        is_mfhi  ? instr[15:11] :
+        is_mflo  ? instr[15:11] :
         is_jal   ? 5'd31 :
         (is_alu_i | is_lui | is_lw | is_lbu) ? instr[20:16] :
         5'd0;
@@ -105,14 +116,15 @@ module instruction_decoder (
     dst_field_t dst_field_int;
     always_comb begin
         dst_field_int = DST_NONE;
-        if (is_alu_r) dst_field_int = DST_RD;
+        if (is_alu_r || is_mfhi || is_mflo) dst_field_int = DST_RD;
         else if (is_alu_i || is_lui || is_lw || is_lbu) dst_field_int = DST_RT;
     end
 
     // 源寄存器读取需求
     wire read_rs_int = (is_alu_r && !(is_sll | is_srl)) | is_jr | is_alu_i | is_lw | is_sw | is_lbu | is_sb |
+                       is_mult | is_multu | is_div | is_divu | is_mthi | is_mtlo |
                        is_beq | is_bne;
-    wire read_rt_int = is_alu_r | is_sw | is_sb | is_beq | is_bne;
+    wire read_rt_int = is_alu_r | is_sw | is_sb | is_beq | is_bne | is_mult | is_multu | is_div | is_divu;
 
     // 资源/执行意图
     wire use_alu_int = is_alu_r | is_alu_i | is_beq | is_bne;
@@ -137,7 +149,7 @@ module instruction_decoder (
         if (is_lw || is_lbu) wb_sel_int = WB_MEM;
         else if (is_lui) wb_sel_int = WB_LUI;
         else if (is_jal) wb_sel_int = WB_LINK;
-        else if (is_alu_r || is_alu_i) wb_sel_int = WB_ALU;
+        else if (is_alu_r || is_alu_i || is_mfhi || is_mflo) wb_sel_int = WB_ALU;
     end
 
     // 控制流类型
@@ -154,33 +166,43 @@ module instruction_decoder (
     // 输出
     // ---------------------------------------------------------
 
-    assign info.opcode              = opc;
-    assign info.rs                  = is_syscall ? 5'd2 : instr[25:21];
-    assign info.rt                  = is_syscall ? 5'd4 : instr[20:16];
-    assign info.rd                  = instr[15:11];
-    assign info.funct               = instr[5:0];
-    assign info.imm16               = instr[15:0];
-    assign info.imm16_sign_ext      = {{16{instr[15]}}, instr[15:0]};
-    assign info.imm16_zero_ext      = {16'b0, instr[15:0]};
-    assign info.jump_target         = instr[25:0];
+    assign info.opcode = opc;
+    assign info.rs = is_syscall ? 5'd2 : instr[25:21];
+    assign info.rt = is_syscall ? 5'd4 : instr[20:16];
+    assign info.rd = instr[15:11];
+    assign info.funct = instr[5:0];
+    assign info.imm16 = instr[15:0];
+    assign info.imm16_sign_ext = {{16{instr[15]}}, instr[15:0]};
+    assign info.imm16_zero_ext = {16'b0, instr[15:0]};
+    assign info.jump_target = instr[25:0];
 
-    assign info.cf_kind             = cf_kind_int;
-    assign info.read_rs             = read_rs_int | is_syscall;
-    assign info.read_rt             = read_rt_int | is_syscall;
-    assign info.write_gpr           = write_gpr_int;
-    assign info.dst_lr              = write_gpr_int ? dst_lr_int : 5'd0;
-    assign info.dst_field           = dst_field_int;
+    assign info.cf_kind = cf_kind_int;
+    assign info.read_rs = read_rs_int | is_syscall;
+    assign info.read_rt = read_rt_int | is_syscall;
+    assign info.write_gpr = write_gpr_int;
+    assign info.dst_lr = write_gpr_int ? dst_lr_int : 5'd0;
+    assign info.dst_field = dst_field_int;
 
-    assign info.use_alu             = use_alu_int;
-    assign info.alu_op              = alu_op_int;
-    assign info.alu_b_is_imm        = alu_b_is_imm_int;
+    assign info.use_alu = use_alu_int;
+    assign info.alu_op = alu_op_int;
+    assign info.alu_b_is_imm = alu_b_is_imm_int;
     assign info.alu_imm_is_zero_ext = alu_imm_is_zero_ext_int;
 
-    assign info.mem_read            = mem_read_int;
-    assign info.mem_write           = mem_write_int;
-    assign info.write_ecr           = write_ecr_int;
+    assign info.mem_read = mem_read_int;
+    assign info.mem_write = mem_write_int;
+    assign info.use_muldiv = is_muldiv;
+    assign info.muldiv_op           = is_mfhi  ? 3'd0 :
+                                      is_mflo  ? 3'd1 :
+                                      is_mthi  ? 3'd2 :
+                                      is_mtlo  ? 3'd3 :
+                                      is_mult  ? 3'd4 :
+                                      is_multu ? 3'd5 :
+                                      is_div   ? 3'd6 :
+                                      is_divu  ? 3'd7 : 3'd0;
+    assign info.muldiv_start = is_mult | is_multu | is_div | is_divu;
+    assign info.write_ecr = write_ecr_int;
 
-    assign info.is_syscall          = is_syscall;
-    assign info.wb_sel              = wb_sel_int;
+    assign info.is_syscall = is_syscall;
+    assign info.wb_sel = wb_sel_int;
 
 endmodule

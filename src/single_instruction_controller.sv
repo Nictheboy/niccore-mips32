@@ -30,6 +30,11 @@ module single_instruction_controller #(
     input  alu_ans_t             alu_ans,
     input  logic                 alu_grant,
 
+    output rpl_req#(ID_WIDTH)::t muldiv_rpl,
+    output muldiv_req_t          muldiv_req,
+    input  muldiv_ans_t          muldiv_ans,
+    input  logic                 muldiv_grant,
+
     // 与 ECR 交互 (简化接口)
     // 读接口：直接输出地址，组合逻辑读取
     output logic                                               ecr_read_en,
@@ -54,22 +59,25 @@ module single_instruction_controller #(
         SEL_ALU,
         SEL_MEM,
         SEL_IMM,
+        SEL_MULDIV,
         SEL_JR,
         SEL_SYSCALL
     } sel_t;
     sel_t sel_r, sel_now;
 
-    logic kind_mem, kind_alu, kind_syscall, kind_jr, kind_imm;
+    logic kind_mem, kind_alu, kind_muldiv, kind_syscall, kind_jr, kind_imm;
     assign kind_mem = packet_in.valid && (packet_in.info.mem_read || packet_in.info.mem_write);
     assign kind_alu = packet_in.valid && !kind_mem && (packet_in.info.use_alu || packet_in.info.write_ecr);
-    assign kind_syscall = packet_in.valid && !kind_mem && !kind_alu && packet_in.info.is_syscall;
-    assign kind_jr = packet_in.valid && !kind_mem && !kind_alu && !kind_syscall &&
+    assign kind_muldiv = packet_in.valid && !kind_mem && !kind_alu && packet_in.info.use_muldiv;
+    assign kind_syscall = packet_in.valid && !kind_mem && !kind_alu && !kind_muldiv && packet_in.info.is_syscall;
+    assign kind_jr = packet_in.valid && !kind_mem && !kind_alu && !kind_muldiv && !kind_syscall &&
                      (packet_in.info.cf_kind == CF_JUMP_REG);
-    assign kind_imm = packet_in.valid && !kind_mem && !kind_alu && !kind_syscall && !kind_jr;
+    assign kind_imm = packet_in.valid && !kind_mem && !kind_alu && !kind_muldiv && !kind_syscall && !kind_jr;
     always_comb begin
         if (packet_in.valid) begin
             if (kind_mem) sel_now = SEL_MEM;
             else if (kind_alu) sel_now = SEL_ALU;
+            else if (kind_muldiv) sel_now = SEL_MULDIV;
             else if (kind_syscall) sel_now = SEL_SYSCALL;
             else if (kind_jr) sel_now = SEL_JR;
             else sel_now = SEL_IMM;
@@ -79,24 +87,27 @@ module single_instruction_controller #(
     end
 
     // gated packets
-    sic_packet_t pkt_alu, pkt_mem, pkt_imm, pkt_jr, pkt_syscall;
+    sic_packet_t pkt_alu, pkt_mem, pkt_imm, pkt_muldiv, pkt_jr, pkt_syscall;
     always_comb begin
         pkt_alu = packet_in;
         pkt_mem = packet_in;
         pkt_imm = packet_in;
+        pkt_muldiv = packet_in;
         pkt_jr = packet_in;
         pkt_syscall = packet_in;
         pkt_alu.valid = packet_in.valid && (sel_now == SEL_ALU);
         pkt_mem.valid = packet_in.valid && (sel_now == SEL_MEM);
         pkt_imm.valid = packet_in.valid && (sel_now == SEL_IMM);
+        pkt_muldiv.valid = packet_in.valid && (sel_now == SEL_MULDIV);
         pkt_jr.valid = packet_in.valid && (sel_now == SEL_JR);
         pkt_syscall.valid = packet_in.valid && (sel_now == SEL_SYSCALL);
     end
 
     // 子 SIC bundle
-    sic_sub_in #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t in_alu, in_mem, in_imm, in_jr, in_syscall;
+    sic_sub_in #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t
+        in_alu, in_mem, in_imm, in_muldiv, in_jr, in_syscall;
     sic_sub_out #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t
-        out_alu, out_mem, out_imm, out_jr, out_syscall;
+        out_alu, out_mem, out_imm, out_muldiv, out_jr, out_syscall;
     sic_sub_out #(NUM_PHY_REGS, ID_WIDTH, NUM_ECRS)::t out_sel;
 
     // 保存最近一次接收到的 packet（用于 PR 占用声明在后续周期持续有效）
@@ -107,48 +118,70 @@ module single_instruction_controller #(
         in_alu = '0;
         in_mem = '0;
         in_imm = '0;
+        in_muldiv = '0;
         in_jr = '0;
         in_syscall = '0;
 
         in_alu.pkt = pkt_alu;
         in_mem.pkt = pkt_mem;
         in_imm.pkt = pkt_imm;
+        in_muldiv.pkt = pkt_muldiv;
         in_jr.pkt = pkt_jr;
         in_syscall.pkt = pkt_syscall;
 
         in_alu.reg_ans = reg_ans;
         in_mem.reg_ans = reg_ans;
         in_imm.reg_ans = reg_ans;
+        in_muldiv.reg_ans = reg_ans;
         in_jr.reg_ans = reg_ans;
         in_syscall.reg_ans = reg_ans;
 
         in_alu.mem_rdata = mem_rdata;
         in_mem.mem_rdata = mem_rdata;
         in_imm.mem_rdata = mem_rdata;
+        in_muldiv.mem_rdata = mem_rdata;
         in_jr.mem_rdata = mem_rdata;
         in_syscall.mem_rdata = mem_rdata;
 
         in_alu.mem_grant = mem_grant;
         in_mem.mem_grant = mem_grant;
         in_imm.mem_grant = mem_grant;
+        in_muldiv.mem_grant = mem_grant;
         in_jr.mem_grant = mem_grant;
         in_syscall.mem_grant = mem_grant;
 
         in_alu.alu_ans = alu_ans;
         in_mem.alu_ans = alu_ans;
         in_imm.alu_ans = alu_ans;
+        in_muldiv.alu_ans = alu_ans;
         in_jr.alu_ans = alu_ans;
         in_syscall.alu_ans = alu_ans;
 
         in_alu.alu_grant = alu_grant;
         in_mem.alu_grant = alu_grant;
         in_imm.alu_grant = alu_grant;
+        in_muldiv.alu_grant = alu_grant;
         in_jr.alu_grant = alu_grant;
         in_syscall.alu_grant = alu_grant;
+
+        in_alu.muldiv_ans = muldiv_ans;
+        in_mem.muldiv_ans = muldiv_ans;
+        in_imm.muldiv_ans = muldiv_ans;
+        in_muldiv.muldiv_ans = muldiv_ans;
+        in_jr.muldiv_ans = muldiv_ans;
+        in_syscall.muldiv_ans = muldiv_ans;
+
+        in_alu.muldiv_grant = muldiv_grant;
+        in_mem.muldiv_grant = muldiv_grant;
+        in_imm.muldiv_grant = muldiv_grant;
+        in_muldiv.muldiv_grant = muldiv_grant;
+        in_jr.muldiv_grant = muldiv_grant;
+        in_syscall.muldiv_grant = muldiv_grant;
 
         in_alu.ecr_read_data = ecr_read_data;
         in_mem.ecr_read_data = ecr_read_data;
         in_imm.ecr_read_data = ecr_read_data;
+        in_muldiv.ecr_read_data = ecr_read_data;
         in_jr.ecr_read_data = ecr_read_data;
         in_syscall.ecr_read_data = ecr_read_data;
     end
@@ -189,6 +222,18 @@ module single_instruction_controller #(
         .out(out_imm)
     );
 
+    sic_exec_muldiv #(
+        .SIC_ID(SIC_ID),
+        .NUM_PHY_REGS(NUM_PHY_REGS),
+        .NUM_ECRS(NUM_ECRS),
+        .ID_WIDTH(ID_WIDTH)
+    ) u_muldiv (
+        .clk(clk),
+        .rst_n(rst_n),
+        .in(in_muldiv),
+        .out(out_muldiv)
+    );
+
     sic_exec_jr #(
         .SIC_ID(SIC_ID),
         .NUM_PHY_REGS(NUM_PHY_REGS),
@@ -214,7 +259,8 @@ module single_instruction_controller #(
     );
 
     // 顶层 req_instr：仅当所有子 SIC 均在等待指令时才请求
-    assign req_instr = out_alu.req_instr & out_mem.req_instr & out_imm.req_instr & out_jr.req_instr &
+    assign req_instr = out_alu.req_instr & out_mem.req_instr & out_imm.req_instr & out_muldiv.req_instr &
+                       out_jr.req_instr &
                        out_syscall.req_instr;
 
     // 选择输出 bundle（当拍优先使用 sel_now）
@@ -222,6 +268,7 @@ module single_instruction_controller #(
         unique case (sel_now)
             SEL_ALU: out_sel = out_alu;
             SEL_MEM: out_sel = out_mem;
+            SEL_MULDIV: out_sel = out_muldiv;
             SEL_JR: out_sel = out_jr;
             SEL_SYSCALL: out_sel = out_syscall;
             default: out_sel = out_imm;
@@ -243,6 +290,8 @@ module single_instruction_controller #(
         mem_req = out_sel.mem_req;
         alu_rpl = out_sel.alu_rpl;
         alu_req = out_sel.alu_req;
+        muldiv_rpl = out_sel.muldiv_rpl;
+        muldiv_req = out_sel.muldiv_req;
         ecr_read_en = packet_in.valid | holding_exec;
         ecr_read_addr = packet_in.valid ? packet_in.dep_ecr_id[ECR_AW-1:0] :
                         holding_exec    ? pkt_hold.dep_ecr_id[ECR_AW-1:0] : '0;

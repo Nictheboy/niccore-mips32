@@ -70,6 +70,11 @@ module superscalar_machine (
     alu_ans_t sic_alu_ans[NUM_SICS];
     logic sic_alu_grant[NUM_SICS];
 
+    rpl_req #(ID_WIDTH)::t muldiv_rpl[NUM_SICS];
+    muldiv_req_t sic_muldiv_req[NUM_SICS];
+    muldiv_ans_t sic_muldiv_ans[NUM_SICS];
+    logic sic_muldiv_grant[NUM_SICS];
+
     // SIC <-> Memory (packed)
     rpl_req #(ID_WIDTH)::t mem_rpl[NUM_SICS];
     mem_req_t mem_req[NUM_SICS];
@@ -161,6 +166,11 @@ module superscalar_machine (
                 .alu_ans  (sic_alu_ans[i]),
                 .alu_grant(sic_alu_grant[i]),
 
+                .muldiv_rpl  (muldiv_rpl[i]),
+                .muldiv_req  (sic_muldiv_req[i]),
+                .muldiv_ans  (sic_muldiv_ans[i]),
+                .muldiv_grant(sic_muldiv_grant[i]),
+
                 // ECR Port (Simplified)
                 .ecr_read_addr(sic_ecr_read_addr[i]),
                 .ecr_read_data(sic_ecr_read_data[i]),  // SIC 从这里读取，这是 Input
@@ -225,6 +235,19 @@ module superscalar_machine (
         .sic_alu_req(sic_alu_req),
         .sic_alu_ans(sic_alu_ans),
         .sic_grant_out(sic_alu_grant)
+    );
+
+    muldiv_array_with_lock #(
+        .NUM_MDUS (NUM_MDUS),
+        .NUM_PORTS(NUM_SICS),
+        .ID_WIDTH (ID_WIDTH)
+    ) muldiv_pool (
+        .clk(clk),
+        .rst_n(rst_n),
+        .sic_rpl(muldiv_rpl),
+        .sic_req(sic_muldiv_req),
+        .sic_ans(sic_muldiv_ans),
+        .sic_grant_out(sic_muldiv_grant)
     );
 
     // 7. ECR File (简化版)
