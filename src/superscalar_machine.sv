@@ -23,7 +23,8 @@ module superscalar_machine (
     // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-1.txt";
     // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-2.txt";
     // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-4.txt";
-    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-8.txt";
+    // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/add-8.txt";
+    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/lfsr.txt";
     localparam int DMEM_DEPTH = 2048;
     localparam int DMEM_NUM_BANKS = 4;
 
