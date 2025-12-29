@@ -13,7 +13,7 @@ module superscalar_machine (
     localparam int NUM_SICS = 8;
     localparam int NUM_PHY_REGS = 64;
     localparam int NUM_ALUS = 8;
-    localparam int NUM_ECRS = 4;
+    localparam int NUM_ECRS = 8;
     localparam int ID_WIDTH = 16;
     localparam int TOTAL_REG_PORTS = NUM_SICS * 3;
     localparam int ECR_ADDR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
