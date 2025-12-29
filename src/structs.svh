@@ -38,7 +38,9 @@ typedef enum logic [5:0] {
     OPC_SLTI,
     OPC_LUI,
     OPC_LW,
-    OPC_SW
+    OPC_SW,
+    OPC_LBU,
+    OPC_SB
 } opcode_t;
 
 // -----------------------------

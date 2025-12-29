@@ -51,12 +51,19 @@ module sic_exec_mem #(
 
     logic        [31:0] mem_addr_hold;  // byte addr
     logic        [31:0] mem_wdata_hold;
+    logic        [31:0] sb_word_hold;
+    logic        [1:0]  sb_phase;
 
     // Abort：依赖的 ECR 为 10 时，丢弃当前指令
     logic               abort_mispredict;
 
     logic               rf_ok;
     logic               ecr_ok;
+    logic               is_lbu;
+    logic               is_sb;
+    logic        [1:0]  byte_off;
+    logic        [31:0] load_data;
+    logic        [31:0] store_word;
 
     // 组合逻辑计算锁请求
     always_comb begin
@@ -71,18 +78,41 @@ module sic_exec_mem #(
         // req instr：必须把 packet_in.valid 也考虑进去，避免 issue 连发导致丢包
         out.req_instr = !busy && !packet_in.valid;
 
+        is_lbu = (pkt.info.opcode == OPC_LBU);
+        is_sb  = (pkt.info.opcode == OPC_SB);
+        byte_off = mem_addr_hold[1:0];
+
+        load_data = mem_rdata;
+        if (is_lbu) begin
+            unique case (byte_off)
+                2'd0: load_data = {24'b0, mem_rdata[7:0]};
+                2'd1: load_data = {24'b0, mem_rdata[15:8]};
+                2'd2: load_data = {24'b0, mem_rdata[23:16]};
+                default: load_data = {24'b0, mem_rdata[31:24]};
+            endcase
+        end
+
+        store_word = sb_word_hold;
+        unique case (byte_off)
+            2'd0: store_word[7:0]   = mem_wdata_hold[7:0];
+            2'd1: store_word[15:8]  = mem_wdata_hold[7:0];
+            2'd2: store_word[23:16] = mem_wdata_hold[7:0];
+            default: store_word[31:24] = mem_wdata_hold[7:0];
+        endcase
+
         // mem lock & request
         out.mem_rpl.req_issue_id = pkt.issue_id;
         out.mem_rpl.req = mem_wait && !abort_mispredict;
-        out.mem_rpl.release_lock = mem_wait && mem_grant;
+        out.mem_rpl.release_lock = mem_wait && (!is_sb ? mem_grant : (sb_phase == 2'd2));
 
         out.mem_req.addr = mem_addr_hold[31:2];
-        out.mem_req.wdata = mem_wdata_hold;
-        out.mem_req.wen = mem_wait && mem_grant && pkt.info.mem_write && !abort_mispredict;
+        out.mem_req.wdata = is_sb ? store_word : mem_wdata_hold;
+        out.mem_req.wen = mem_wait && mem_grant && pkt.info.mem_write && !abort_mispredict &&
+                          (!is_sb || (sb_phase == 2'd1));
 
-        // RF commit (LW only)
+        // RF commit
         out.reg_req = '0;
-        out.reg_req.wdata = mem_rdata;
+        out.reg_req.wdata = load_data;
         out.reg_req.wcommit = mem_wait && mem_grant && pkt.info.mem_read && pkt.info.write_gpr &&
                               !abort_mispredict;
     end
@@ -95,27 +125,45 @@ module sic_exec_mem #(
             pkt <= '0;
             mem_addr_hold <= 32'b0;
             mem_wdata_hold <= 32'b0;
+            sb_word_hold <= 32'b0;
+            sb_phase <= 2'd0;
         end else begin
             if (!busy) begin
                 if (packet_in.valid) begin
                     pkt <= packet_in;
                     busy <= 1'b1;
                     mem_wait <= 1'b0;
+                    sb_phase <= 2'd0;
                 end
             end else begin
                 if (abort_mispredict) begin
                     busy <= 1'b0;
                     mem_wait <= 1'b0;
+                    sb_phase <= 2'd0;
                 end else if (!mem_wait) begin
                     if (rf_ok && (pkt.info.mem_read || ecr_ok)) begin
                         mem_addr_hold <= reg_ans.rs_rdata + pkt.info.imm16_sign_ext;  // byte addr
                         mem_wdata_hold <= reg_ans.rt_rdata;
                         mem_wait <= 1'b1;
+                        sb_phase <= 2'd0;
                     end
                 end else begin
-                    if (mem_grant) begin
+                    if ((pkt.info.opcode == OPC_SB) && (sb_phase == 2'd2)) begin
                         busy <= 1'b0;
                         mem_wait <= 1'b0;
+                        sb_phase <= 2'd0;
+                    end else if (mem_grant) begin
+                        if (pkt.info.opcode == OPC_SB) begin
+                            if (sb_phase == 2'd0) begin
+                                sb_word_hold <= mem_rdata;
+                                sb_phase <= 2'd1;
+                            end else if (sb_phase == 2'd1) begin
+                                sb_phase <= 2'd2;
+                            end
+                        end else begin
+                            busy <= 1'b0;
+                            mem_wait <= 1'b0;
+                        end
                     end
                 end
             end

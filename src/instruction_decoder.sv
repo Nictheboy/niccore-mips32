@@ -27,6 +27,8 @@ function automatic opcode_t opcode_enum(input logic [5:0] raw);
             6'h0f:   r = OPC_LUI;
             6'h23:   r = OPC_LW;
             6'h2b:   r = OPC_SW;
+            6'h24:   r = OPC_LBU;
+            6'h28:   r = OPC_SB;
             default: r = OPC_INVALID;
         endcase
         return r;
@@ -77,6 +79,8 @@ module instruction_decoder (
     wire is_lui = (opc == OPC_LUI);
     wire is_lw = (opc == OPC_LW);
     wire is_sw = (opc == OPC_SW);
+    wire is_lbu = (opc == OPC_LBU);
+    wire is_sb = (opc == OPC_SB);
     wire is_beq = (opc == OPC_BEQ);
     wire is_bne = (opc == OPC_BNE);
     wire is_j = (opc == OPC_J);
@@ -89,11 +93,11 @@ module instruction_decoder (
     wb_sel_t wb_sel_int;
 
     // 目的逻辑寄存器号（用于重命名/执行）
-    wire write_gpr_int = is_alu_r | is_alu_i | is_lui | is_lw | is_jal;
+    wire write_gpr_int = is_alu_r | is_alu_i | is_lui | is_lw | is_lbu | is_jal;
     wire [4:0] dst_lr_int =
         is_alu_r ? instr[15:11] :
         is_jal   ? 5'd31 :
-        (is_alu_i | is_lui | is_lw) ? instr[20:16] :
+        (is_alu_i | is_lui | is_lw | is_lbu) ? instr[20:16] :
         5'd0;
 
     // 目的字段类型（调试用）
@@ -101,17 +105,18 @@ module instruction_decoder (
     always_comb begin
         dst_field_int = DST_NONE;
         if (is_alu_r) dst_field_int = DST_RD;
-        else if (is_alu_i || is_lui || is_lw) dst_field_int = DST_RT;
+        else if (is_alu_i || is_lui || is_lw || is_lbu) dst_field_int = DST_RT;
     end
 
     // 源寄存器读取需求
-    wire read_rs_int = (is_alu_r && !(is_sll | is_srl)) | is_jr | is_alu_i | is_lw | is_sw | is_beq | is_bne;
-    wire read_rt_int = is_alu_r | is_sw | is_beq | is_bne;
+    wire read_rs_int = (is_alu_r && !(is_sll | is_srl)) | is_jr | is_alu_i | is_lw | is_sw | is_lbu | is_sb |
+                       is_beq | is_bne;
+    wire read_rt_int = is_alu_r | is_sw | is_sb | is_beq | is_bne;
 
     // 资源/执行意图
     wire use_alu_int = is_alu_r | is_alu_i | is_beq | is_bne;
-    wire mem_read_int = is_lw;
-    wire mem_write_int = is_sw;
+    wire mem_read_int = is_lw | is_lbu;
+    wire mem_write_int = is_sw | is_sb;
     wire write_ecr_int = is_beq | is_bne;
 
     // ALU 控制（use_alu_int=1 时有效）
@@ -128,7 +133,7 @@ module instruction_decoder (
     // 写回来源
     always_comb begin
         wb_sel_int = WB_NONE;
-        if (is_lw) wb_sel_int = WB_MEM;
+        if (is_lw || is_lbu) wb_sel_int = WB_MEM;
         else if (is_lui) wb_sel_int = WB_LUI;
         else if (is_jal) wb_sel_int = WB_LINK;
         else if (is_alu_r || is_alu_i) wb_sel_int = WB_ALU;
