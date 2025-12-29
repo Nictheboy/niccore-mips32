@@ -13,6 +13,7 @@ module superscalar_machine (
     localparam int NUM_SICS = 8;
     localparam int NUM_PHY_REGS = 64;
     localparam int NUM_ALUS = 8;
+    localparam int NUM_MDUS = 1;
     localparam int NUM_ECRS = 8;
     localparam int ID_WIDTH = 16;
     localparam int TOTAL_REG_PORTS = NUM_SICS * 3;
@@ -27,7 +28,8 @@ module superscalar_machine (
     // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/lfsr.txt";
     // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/pointer-chasing.txt";
     // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/gcd-softmul.txt";
-    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/gcd-hardmul.txt";
+    // localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/gcd-hardmul.txt";
+    localparam string IMEM_INIT_FILE = "/home/nictheboy/Documents/niccore-mips32/test/floyd.txt";
     localparam int DMEM_DEPTH = 2048;
     localparam int DMEM_NUM_BANKS = 4;
 
