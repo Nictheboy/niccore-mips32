@@ -1,9 +1,6 @@
 
 `include "structs.svh"
 
-// Issue controller:
-// - 负责取指、重命名、分支检查点管理、以及向各 SIC 分发 packet
-
 module issue_controller #(
     parameter int NUM_SICS,
     parameter int NUM_PHY_REGS,
@@ -25,25 +22,18 @@ module issue_controller #(
     input logic [31:0] sic_pc_redirect_pc[NUM_SICS],
     input logic [ID_WIDTH-1:0] sic_pc_redirect_issue_id[NUM_SICS],
 
-    // 回滚指示（调试/监控用）
     output logic rollback_trigger,
 
-    // Register File allocate
     output logic rf_alloc_wen[NUM_SICS],
     output logic [$clog2(NUM_PHY_REGS)-1:0] rf_alloc_pr[NUM_SICS],
 
-    // Register File usage bitmap:
-    // 1 表示该 PR 正被某个 SIC 引用（rs/rt/waddr），分配器不得复用
     input logic [NUM_PHY_REGS-1:0] pr_not_idle,
 
-    // ECR monitor：提供每个 ECR 的 2-bit 状态（00/01/10），用于管理快照生命周期
     input logic [1:0] ecr_monitor[NUM_ECRS],
     input logic [NUM_ECRS-1:0] ecr_in_use,
 
-    // Issue -> ECR：统一更新（reset + bpinfo）
     output ecr_reset_for_issue#(NUM_ECRS)::t ecr_update,
 
-    // ECR -> BP：由 ECR 产生更新，issue_controller 仅转接
     input bp_update_t bp_update
 );
 
@@ -57,6 +47,15 @@ module issue_controller #(
     // JR：发射后暂停，直到收到匹配 issue_id 的重定向
     logic jr_waiting;
     logic [ID_WIDTH-1:0] jr_wait_issue_id;
+
+    logic pending_valid;
+    cf_kind_t pending_kind;
+    logic [31:0] pending_target_pc;
+    logic [31:0] pending_alt_pc;
+    logic pending_pred_taken;
+    logic [ECR_W-1:0] pending_ecr;
+    logic [ECR_W-1:0] pending_parent;
+    logic [ID_WIDTH-1:0] pending_issue_id;
 
     logic [NUM_ECRS-1:0] ecr_poison_pending;
     logic [NUM_ECRS-1:0] ecr_free_pending;
@@ -176,6 +175,14 @@ module issue_controller #(
             global_issue_id <= '0;
             jr_waiting <= 1'b0;
             jr_wait_issue_id <= '0;
+            pending_valid <= 1'b0;
+            pending_kind <= CF_NONE;
+            pending_target_pc <= 32'b0;
+            pending_alt_pc <= 32'b0;
+            pending_pred_taken <= 1'b0;
+            pending_ecr <= '0;
+            pending_parent <= '0;
+            pending_issue_id <= '0;
             rollback_trigger <= 1'b0;
             ecr_poison_pending <= '0;
             ecr_free_pending <= '0;
@@ -305,6 +312,7 @@ module issue_controller #(
                 // 恢复依赖链到 parent（未知则置 00）
                 if (parent_valid) active_ecr <= parent_id;
                 else active_ecr <= '0;
+                pending_valid <= 1'b0;
             end else if (jr_waiting) begin
                 // 3) JR 等待：暂停发射直到重定向到来
                 logic got;
@@ -334,6 +342,15 @@ module issue_controller #(
                 logic [NUM_PHY_REGS-1:0] used_work;
                 logic [ECR_W-1:0] active_ecr_work;
                 logic [ECR_W-1:0] ecr_alloc_ptr_work;
+                logic pend_v;
+                cf_kind_t pend_k;
+                logic [31:0] pend_target;
+                logic [31:0] pend_alt;
+                logic pend_pred_taken;
+                logic [ECR_W-1:0] pend_ecr;
+                logic [ECR_W-1:0] pend_parent;
+                logic [ID_WIDTH-1:0] pend_issue_id;
+                int ds_slot;
 
                 issued = 0;
                 next_pc = pc;
@@ -345,6 +362,16 @@ module issue_controller #(
                 st_work = cur_state;
                 active_ecr_work = active_ecr;
                 ecr_alloc_ptr_work = ecr_alloc_ptr;
+
+                pend_v = pending_valid;
+                pend_k = pending_kind;
+                pend_target = pending_target_pc;
+                pend_alt = pending_alt_pc;
+                pend_pred_taken = pending_pred_taken;
+                pend_ecr = pending_ecr;
+                pend_parent = pending_parent;
+                pend_issue_id = pending_issue_id;
+                ds_slot = pend_v ? 0 : -1;
 
                 // used = cur_state + 所有有效 ckpt_state + pr_not_idle
                 used_work = calc_used_pr(st_work);
@@ -365,14 +392,15 @@ module issue_controller #(
                         logic [ECR_W-1:0] alloc_e;
                         logic [31:0] ip;
                         logic [31:0] br_tgt;
-                        logic [31:0] fall;
                         logic [31:0] j_tgt;
+                        logic is_delay_slot;
                         logic [NUM_ECRS-1:0] forbid_ecr;
                         logic [ECR_W-1:0] walk;
                         logic alloc_ok;
                         int cand;
 
                         slot = issued;
+                        is_delay_slot = pend_v && (slot == ds_slot);
 
                         // 默认发射（后续按需要覆盖字段）
                         sic_packet_out[sic] <= '0;
@@ -428,12 +456,16 @@ module issue_controller #(
                         end
 
                         // 分支：分配 ECR + 保存检查点 + 预测 PC/altPC
-                        if (!stall && (dec_info[slot].cf_kind == CF_BRANCH) && branch_issued) begin
+                        if (pend_v && (slot != ds_slot)) begin
+                            sic_packet_out[sic] <= '0;
+                            sic_packet_out[sic].valid <= 1'b0;
+                            stall = 1'b1;
+                        end else if (!stall && !is_delay_slot && (dec_info[slot].cf_kind == CF_BRANCH) && branch_issued) begin
                             // 每周期最多发射一个分支（ecr_update/ckpt 为单端口）
                             sic_packet_out[sic] <= '0;
                             sic_packet_out[sic].valid <= 1'b0;
                             stall = 1'b1;
-                        end else if (!stall && (dec_info[slot].cf_kind == CF_BRANCH)) begin
+                        end else if (!stall && !is_delay_slot && (dec_info[slot].cf_kind == CF_BRANCH)) begin
                             forbid_ecr = '0;
                             walk = active_ecr_work;
                             for (int it = 0; it < NUM_ECRS; it++) begin
@@ -461,10 +493,6 @@ module issue_controller #(
                                 sic_packet_out[sic].valid <= 1'b0;
                                 stall = 1'b1;
                             end else begin
-                                ckpt_state[alloc_e] <= st_work;
-                                ckpt_valid[alloc_e] <= 1'b1;
-                                ckpt_parent[alloc_e] <= active_ecr_work;
-                                ckpt_parent_valid[alloc_e] <= 1'b1;
                                 ecr_pending_busy[alloc_e] <= 1'b1;
                                 ckpt_seen_nonfree[alloc_e] <= 1'b0;
 
@@ -480,41 +508,70 @@ module issue_controller #(
 
                                 ecr_alloc_ptr_work = (alloc_e == (NUM_ECRS-1)) ? ECR_W'(1) : (alloc_e + 1);
 
-                                active_ecr_work = alloc_e;
                                 branch_issued = 1'b1;
 
                                 ckpt_age[alloc_e] <= global_issue_id + ID_WIDTH'(slot);
 
                                 ip = pc + (slot << 2);
                                 br_tgt = ip + 32'd4 + (dec_info[slot].imm16_sign_ext << 2);
-                                fall = ip + 32'd4;
+                                sic_packet_out[sic].next_pc_pred <= pred_taken_w[slot] ? br_tgt : (ip + 32'd8);
 
-                                if (pred_taken_w[slot]) begin
-                                    sic_packet_out[sic].next_pc_pred <= br_tgt;
-                                    ckpt_alt_pc[alloc_e] <= fall;
-                                    next_pc = br_tgt;
-                                    cut_packet = 1'b1;
-                                end else begin
-                                    sic_packet_out[sic].next_pc_pred <= fall;
-                                    ckpt_alt_pc[alloc_e] <= br_tgt;
-                                end
+                                pend_v = 1'b1;
+                                pend_k = CF_BRANCH;
+                                pend_ecr = alloc_e;
+                                pend_parent = active_ecr_work;
+                                pend_pred_taken = pred_taken_w[slot];
+                                pend_target = pred_taken_w[slot] ? br_tgt : (ip + 32'd8);
+                                pend_alt = pred_taken_w[slot] ? (ip + 32'd8) : br_tgt;
+                                ds_slot = slot + 1;
                             end
-                        end else if (!stall && (dec_info[slot].cf_kind == CF_JUMP_IMM)) begin
+                        end else if (!stall && !is_delay_slot && (dec_info[slot].cf_kind == CF_JUMP_IMM)) begin
                             ip = pc + (slot << 2);
                             j_tgt = {ip[31:28], dec_info[slot].jump_target, 2'b00};
                             sic_packet_out[sic].next_pc_pred <= j_tgt;
-                            next_pc = j_tgt;
-                            cut_packet = 1'b1;
-                        end else if (!stall && (dec_info[slot].cf_kind == CF_JUMP_REG)) begin
-                            // JR：等待 SIC 提交重定向
-                            jr_waiting <= 1'b1;
-                            jr_wait_issue_id <= global_issue_id + ID_WIDTH'(slot);
+                            if (dec_info[slot].opcode == OPC_JAL) begin
+                                sic_packet_out[sic].pc <= ip + 32'd4;
+                            end
+                            pend_v = 1'b1;
+                            pend_k = CF_JUMP_IMM;
+                            pend_pred_taken = 1'b0;
+                            pend_target = j_tgt;
+                            ds_slot = slot + 1;
+                        end else if (!stall && !is_delay_slot && (dec_info[slot].cf_kind == CF_JUMP_REG)) begin
                             sic_packet_out[sic].next_pc_pred <= 'x;
-                            cut_packet = 1'b1;
+                            pend_v = 1'b1;
+                            pend_k = CF_JUMP_REG;
+                            pend_pred_taken = 1'b0;
+                            pend_issue_id = global_issue_id + ID_WIDTH'(slot);
+                            ds_slot = slot + 1;
                         end
 
                         if (!stall) begin
                             issued++;
+                            if (pend_v && (slot == ds_slot)) begin
+                                if (pend_k == CF_BRANCH) begin
+                                    ckpt_state[pend_ecr] <= st_work;
+                                    ckpt_valid[pend_ecr] <= 1'b1;
+                                    ckpt_parent[pend_ecr] <= pend_parent;
+                                    ckpt_parent_valid[pend_ecr] <= 1'b1;
+                                    ckpt_alt_pc[pend_ecr] <= pend_alt;
+                                    active_ecr_work = pend_ecr;
+                                    if (pend_pred_taken) begin
+                                        next_pc = pend_target;
+                                        cut_packet = 1'b1;
+                                    end
+                                end else if (pend_k == CF_JUMP_IMM) begin
+                                    next_pc = pend_target;
+                                    cut_packet = 1'b1;
+                                end else if (pend_k == CF_JUMP_REG) begin
+                                    jr_waiting <= 1'b1;
+                                    jr_wait_issue_id <= pend_issue_id;
+                                    next_pc = pc + ((slot + 1) << 2);
+                                    cut_packet = 1'b1;
+                                end
+                                pend_v  = 1'b0;
+                                ds_slot = -1;
+                            end
                         end
                     end
                 end
@@ -524,11 +581,17 @@ module issue_controller #(
                 active_ecr <= active_ecr_work;
                 ecr_alloc_ptr <= ecr_alloc_ptr_work;
                 global_issue_id <= global_issue_id + ID_WIDTH'(issued);
+                pending_valid <= pend_v;
+                pending_kind <= pend_k;
+                pending_target_pc <= pend_target;
+                pending_alt_pc <= pend_alt;
+                pending_pred_taken <= pend_pred_taken;
+                pending_ecr <= pend_ecr;
+                pending_parent <= pend_parent;
+                pending_issue_id <= pend_issue_id;
                 if (issued > 0) begin
-                    if (!jr_waiting) begin
-                        if (cut_packet) pc <= next_pc;
-                        else pc <= pc + (issued << 2);
-                    end
+                    if (cut_packet) pc <= next_pc;
+                    else pc <= pc + (issued << 2);
                 end
             end
         end

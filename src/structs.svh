@@ -126,24 +126,24 @@ class sic_packet #(
     localparam int PR_W  = (NUM_PHY_REGS > 1) ? $clog2(NUM_PHY_REGS) : 1;
     localparam int ECR_W = (NUM_ECRS > 1) ? $clog2(NUM_ECRS) : 1;
 
-    typedef struct packed {
-        logic        valid;         // 指令有效位
-        logic [31:0] pc;            // 当前指令 PC
-        logic [31:0] next_pc_pred;  // 预测的下一条 PC (用于 JAL/Branch)
+typedef struct packed {
+    logic        valid;         // 指令有效位
+    logic [31:0] pc;            // 当前指令 PC
+    logic [31:0] next_pc_pred;  // 预测的下一条 PC (用于 JAL/Branch)
 
-        // 锁与排序
-        logic [ID_WIDTH-1:0] issue_id;
+    // 锁与排序
+    logic [ID_WIDTH-1:0] issue_id;
 
-        // 解码信息
-        instr_info_t info;
+    // 解码信息
+    instr_info_t info;
 
-        // 寄存器重命名结果 (物理寄存器号)
+    // 寄存器重命名结果 (物理寄存器号)
         logic [PR_W-1:0] phy_rs;
         logic [PR_W-1:0] phy_rt;
         logic [PR_W-1:0] phy_rd;
         logic [PR_W-1:0] phy_dst;
 
-        // 分支预测与 ECR
+    // 分支预测与 ECR
         logic          pred_taken;
         logic [ECR_W-1:0] dep_ecr_id;
         logic [ECR_W-1:0] set_ecr_id;
