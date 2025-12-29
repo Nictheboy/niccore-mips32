@@ -54,6 +54,9 @@ module sic_exec_jr #(
         out.pc_redirect_valid    = commit_now && (pkt.info.cf_kind == CF_JUMP_REG);
         out.pc_redirect_pc       = reg_ans.rs_rdata;
         out.pc_redirect_issue_id = pkt.issue_id;
+
+        out.reg_req.wdata        = pkt.pc + 32'd4;
+        out.reg_req.wcommit      = commit_now && pkt.info.write_gpr && (pkt.info.wb_sel == WB_LINK);
     end
 
     always_ff @(posedge clk or negedge rst_n) begin

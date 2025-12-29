@@ -52,7 +52,7 @@ module sic_exec_mem #(
     logic        [31:0] mem_addr_hold;  // byte addr
     logic        [31:0] mem_wdata_hold;
     logic        [31:0] sb_word_hold;
-    logic        [1:0]  sb_phase;
+    logic        [ 1:0] sb_phase;
 
     // Abort：依赖的 ECR 为 10 时，丢弃当前指令
     logic               abort_mispredict;
@@ -61,7 +61,11 @@ module sic_exec_mem #(
     logic               ecr_ok;
     logic               is_lbu;
     logic               is_sb;
-    logic        [1:0]  byte_off;
+    logic               is_lb;
+    logic               is_lh;
+    logic               is_lhu;
+    logic               is_sh;
+    logic        [ 1:0] byte_off;
     logic        [31:0] load_data;
     logic        [31:0] store_word;
 
@@ -79,36 +83,58 @@ module sic_exec_mem #(
         out.req_instr = !busy && !packet_in.valid;
 
         is_lbu = (pkt.info.opcode == OPC_LBU);
-        is_sb  = (pkt.info.opcode == OPC_SB);
+        is_sb = (pkt.info.opcode == OPC_SB);
+        is_lb = (pkt.info.opcode == OPC_LB);
+        is_lh = (pkt.info.opcode == OPC_LH);
+        is_lhu = (pkt.info.opcode == OPC_LHU);
+        is_sh = (pkt.info.opcode == OPC_SH);
         byte_off = mem_addr_hold[1:0];
 
         load_data = mem_rdata;
-        if (is_lbu) begin
+        if (is_lb || is_lbu) begin
             unique case (byte_off)
-                2'd0: load_data = {24'b0, mem_rdata[7:0]};
-                2'd1: load_data = {24'b0, mem_rdata[15:8]};
-                2'd2: load_data = {24'b0, mem_rdata[23:16]};
-                default: load_data = {24'b0, mem_rdata[31:24]};
+                2'd0:
+                load_data = is_lb ? {{24{mem_rdata[7]}}, mem_rdata[7:0]} : {24'b0, mem_rdata[7:0]};
+                2'd1:
+                load_data = is_lb ? {{24{mem_rdata[15]}}, mem_rdata[15:8]} :
+                                          {24'b0, mem_rdata[15:8]};
+                2'd2:
+                load_data = is_lb ? {{24{mem_rdata[23]}}, mem_rdata[23:16]} :
+                                          {24'b0, mem_rdata[23:16]};
+                default:
+                load_data = is_lb ? {{24{mem_rdata[31]}}, mem_rdata[31:24]} :
+                                             {24'b0, mem_rdata[31:24]};
             endcase
+        end else if (is_lh || is_lhu) begin
+            if (!byte_off[1]) begin
+                load_data = is_lh ? {{16{mem_rdata[15]}}, mem_rdata[15:0]} : {16'b0, mem_rdata[15:0]};
+            end else begin
+                load_data = is_lh ? {{16{mem_rdata[31]}}, mem_rdata[31:16]} : {16'b0, mem_rdata[31:16]};
+            end
         end
 
         store_word = sb_word_hold;
-        unique case (byte_off)
-            2'd0: store_word[7:0]   = mem_wdata_hold[7:0];
-            2'd1: store_word[15:8]  = mem_wdata_hold[7:0];
-            2'd2: store_word[23:16] = mem_wdata_hold[7:0];
-            default: store_word[31:24] = mem_wdata_hold[7:0];
-        endcase
+        if (is_sh) begin
+            if (!byte_off[1]) store_word[15:0] = mem_wdata_hold[15:0];
+            else store_word[31:16] = mem_wdata_hold[15:0];
+        end else begin
+            unique case (byte_off)
+                2'd0: store_word[7:0] = mem_wdata_hold[7:0];
+                2'd1: store_word[15:8] = mem_wdata_hold[7:0];
+                2'd2: store_word[23:16] = mem_wdata_hold[7:0];
+                default: store_word[31:24] = mem_wdata_hold[7:0];
+            endcase
+        end
 
         // mem lock & request
         out.mem_rpl.req_issue_id = pkt.issue_id;
         out.mem_rpl.req = mem_wait && !abort_mispredict;
-        out.mem_rpl.release_lock = mem_wait && (!is_sb ? mem_grant : (sb_phase == 2'd2));
+        out.mem_rpl.release_lock = mem_wait && (!(is_sb || is_sh) ? mem_grant : (sb_phase == 2'd2));
 
         out.mem_req.addr = mem_addr_hold[31:2];
-        out.mem_req.wdata = is_sb ? store_word : mem_wdata_hold;
+        out.mem_req.wdata = (is_sb || is_sh) ? store_word : mem_wdata_hold;
         out.mem_req.wen = mem_wait && mem_grant && pkt.info.mem_write && !abort_mispredict &&
-                          (!is_sb || (sb_phase == 2'd1));
+                          (!(is_sb || is_sh) || (sb_phase == 2'd1));
 
         // RF commit
         out.reg_req = '0;
@@ -148,12 +174,12 @@ module sic_exec_mem #(
                         sb_phase <= 2'd0;
                     end
                 end else begin
-                    if ((pkt.info.opcode == OPC_SB) && (sb_phase == 2'd2)) begin
+                    if (((pkt.info.opcode == OPC_SB) || (pkt.info.opcode == OPC_SH)) && (sb_phase == 2'd2)) begin
                         busy <= 1'b0;
                         mem_wait <= 1'b0;
                         sb_phase <= 2'd0;
                     end else if (mem_grant) begin
-                        if (pkt.info.opcode == OPC_SB) begin
+                        if ((pkt.info.opcode == OPC_SB) || (pkt.info.opcode == OPC_SH)) begin
                             if (sb_phase == 2'd0) begin
                                 sb_word_hold <= mem_rdata;
                                 sb_phase <= 2'd1;

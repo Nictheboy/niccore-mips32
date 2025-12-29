@@ -71,10 +71,18 @@ module sic_exec_alu #(
         out.reg_req.wdata = in.alu_ans.c;
         out.reg_req.wcommit = commit_now && pkt.info.write_gpr && (pkt.info.wb_sel == WB_ALU);
 
-        // ECR write (BEQ)
+        // ECR write
         out.ecr_wen = commit_now && pkt.info.write_ecr;
         out.ecr_write_addr = pkt.set_ecr_id;
-        br_taken = (pkt.info.opcode == OPC_BNE) ? ~in.alu_ans.zero : in.alu_ans.zero;
+        unique case (pkt.info.opcode)
+            OPC_BNE:  br_taken = ~in.alu_ans.zero;
+            OPC_BEQ:  br_taken = in.alu_ans.zero;
+            OPC_BLEZ: br_taken = ($signed(reg_ans.rs_rdata) <= 0);
+            OPC_BGTZ: br_taken = ($signed(reg_ans.rs_rdata) > 0);
+            OPC_BLTZ: br_taken = reg_ans.rs_rdata[31];
+            OPC_BGEZ: br_taken = ~reg_ans.rs_rdata[31];
+            default:  br_taken = in.alu_ans.zero;
+        endcase
         out.ecr_wdata = (br_taken == pkt.pred_taken) ? 2'b01 : 2'b10;
     end
 

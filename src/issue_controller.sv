@@ -538,6 +538,10 @@ module issue_controller #(
                             pend_target = j_tgt;
                             ds_slot = slot + 1;
                         end else if (!stall && !is_delay_slot && (dec_info[slot].cf_kind == CF_JUMP_REG)) begin
+                            ip = pc + (slot << 2);
+                            if ((dec_info[slot].opcode == OPC_SPECIAL) && (dec_info[slot].funct == 6'h09)) begin
+                                sic_packet_out[sic].pc <= ip + 32'd4;
+                            end
                             sic_packet_out[sic].next_pc_pred <= 'x;
                             pend_v = 1'b1;
                             pend_k = CF_JUMP_REG;
